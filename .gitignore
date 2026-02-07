@@ -1,0 +1,11 @@
+*.iml
+*.log
+.gradle
+.DS_Store
+.externalNativeBuild
+.cxx
+
+/apk
+/build
+
+/app/build
