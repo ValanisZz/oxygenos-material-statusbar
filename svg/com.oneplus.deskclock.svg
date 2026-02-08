@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!-- Left bell -->
+  <path fill="#000" d="M2.12,2.82L6.35,0 8.47,2.82 4.24,5.65Z"/>
+  <!-- Right bell -->
+  <path fill="#000" d="M21.88,2.82L17.65,0 15.53,2.82 19.76,5.65Z"/>
+  <!-- Clock face (ring) -->
+  <path fill="#000" fill-rule="evenodd"
+    d="M12,4.24A9.88,9.88 0 1,0 12,24A9.88,9.88 0 1,0 12,4.24Z
+       M12,5.65A8.47,8.47 0 1,1 12,22.59A8.47,8.47 0 1,1 12,5.65Z"/>
+  <!-- Minute hand (12 o'clock) -->
+  <path fill="#000" d="M11.44,6.21L12.56,6.21 12.56,14.12 11.44,14.12Z"/>
+  <!-- Hour hand (~8 o'clock) -->
+  <path fill="#000" d="M6.93,16.07L7.78,17.53 12.28,14.85 11.44,13.38Z"/>
+  <!-- Center dot -->
+  <circle fill="#000" cx="12" cy="14.12" r="1.41"/>
+</svg>

@@ -11,8 +11,8 @@ android {
         applicationId "ru.valanis.oneplus.statusbar.material"
         minSdk 26
         targetSdk 34
-        versionCode 160001
-        versionName "16.0"
+        versionCode 160002
+        versionName "16.1"
     }
 
     signingConfigs {
@@ -21,6 +21,12 @@ android {
             storePassword 'android'
             keyAlias 'androiddebugkey'
             keyPassword 'android'
+        }
+        release {
+            storeFile file(System.getenv('VALANIS_JKS_STORE_FILE') ?: '')
+            storePassword System.getenv('VALANIS_JKS_STORE_PASSWORD') ?: ''
+            keyAlias System.getenv('VALANIS_JKS_KEY_ALIAS') ?: ''
+            keyPassword System.getenv('VALANIS_JKS_KEY_PASSWORD') ?: ''
         }
     }
 

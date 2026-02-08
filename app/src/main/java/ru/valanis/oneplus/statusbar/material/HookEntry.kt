@@ -37,9 +37,45 @@ class HookEntry : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     companion object {
         private const val TAG = "OxygenOSMaterialIcons"
+        private const val MAX_MONOCHROME_CACHE = 100
+        private const val MAX_FIT_CACHE = 80
+        private const val MAX_RAW_ICON_CACHE = 50
+        private const val MAX_DESCRIPTOR_CACHE = 100
+        private const val MODULE_PKG = "ru.valanis.oneplus.statusbar.material"
+        private val CUSTOM_SMALL_ICONS = mapOf(
+            "com.android.mms" to ru.valanis.oneplus.statusbar.material.R.drawable.ic_notify_mms,
+            "com.oplus.battery" to ru.valanis.oneplus.statusbar.material.R.drawable.ic_notify_battery_full,
+            "com.oplus.phonemanager" to ru.valanis.oneplus.statusbar.material.R.drawable.ic_notify_phonemanager,
+            "com.oneplus.deskclock" to ru.valanis.oneplus.statusbar.material.R.drawable.ic_notify_deskclock,
+        )
+    }
+
+    private fun customSmallIcon(pkg: String, notification: Notification? = null): android.graphics.drawable.Icon? {
+        val resId = CUSTOM_SMALL_ICONS[pkg]
+        if (resId != null) return android.graphics.drawable.Icon.createWithResource(MODULE_PKG, resId)
+        if (pkg == "com.android.systemui" && notification != null) {
+            val channelId = try { notification.channelId } catch (_: Throwable) { null } ?: ""
+            val category = try { notification.category } catch (_: Throwable) { null }
+            val isBattery = channelId.contains("battery", ignoreCase = true) ||
+                channelId.contains("bat", ignoreCase = true) ||  // BAT_NEW, etc.
+                channelId.contains("CRG", ignoreCase = true) ||
+                channelId.contains("charge", ignoreCase = true) ||
+                channelId.contains("power", ignoreCase = true) ||
+                channelId.contains("low", ignoreCase = true) ||
+                (category != null && category.contains("battery", ignoreCase = true))
+            if (isBattery) {
+                return android.graphics.drawable.Icon.createWithResource(MODULE_PKG, ru.valanis.oneplus.statusbar.material.R.drawable.ic_notify_battery_full)
+            }
+        }
+        return null
     }
 
     private val iconCache = java.util.concurrent.ConcurrentHashMap<String, android.graphics.drawable.Icon>()
+    private val monochromeCache = java.util.concurrent.ConcurrentHashMap<String, Drawable>()
+    private val fitCache = java.util.concurrent.ConcurrentHashMap<String, Drawable>()
+    private val rawIconCache = java.util.concurrent.ConcurrentHashMap<String, Drawable>()
+    /** Cache for final icon results in getIconDescriptor (status bar + shade). */
+    private val descriptorCache = java.util.concurrent.ConcurrentHashMap<String, android.graphics.drawable.Icon>()
     private val engineHooked = java.util.concurrent.atomic.AtomicBoolean(false)
 
     private val isAodProcess: Boolean by lazy {
@@ -112,8 +148,11 @@ class HookEntry : IXposedHookLoadPackage, IXposedHookZygoteInit {
             override fun afterHookedMethod(param: MethodHookParam) {
                 try {
                     val pkg = XposedHelpers.getObjectField(param.thisObject, "pkg") as? String ?: return
+                    // SystemUI sends varied notifications (battery, eye comfort, alerts)
+                    // with different icons — must always update. Other packages are safe to cache.
+                    if (pkg != "com.android.systemui" && iconCache.containsKey(pkg)) return
                     val notification = param.result as? Notification ?: return
-                    val icon = notification.smallIcon ?: return
+                    val icon = customSmallIcon(pkg, notification) ?: notification.smallIcon ?: return
                     iconCache[pkg] = icon
                 } catch (_: Throwable) {}
             }
@@ -122,10 +161,10 @@ class HookEntry : IXposedHookLoadPackage, IXposedHookZygoteInit {
         XposedBridge.hookAllMethods(sbnClass, "getPackageName", object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 val pkg = param.result as? String ?: return
-                if (iconCache.containsKey(pkg)) return
+                if (pkg != "com.android.systemui" && iconCache.containsKey(pkg)) return
                 try {
                     val notification = XposedHelpers.getObjectField(param.thisObject, "notification") as? Notification ?: return
-                    val icon = notification.smallIcon ?: return
+                    val icon = customSmallIcon(pkg, notification) ?: notification.smallIcon ?: return
                     iconCache[pkg] = icon
                 } catch (_: Throwable) {}
             }
@@ -282,7 +321,17 @@ class HookEntry : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
                             if (!allowConversationGroup) {
                                 // Status bar: tintable monochrome icon
-                                val smallIcon = notification.smallIcon ?: return
+                                val smallIcon = customSmallIcon(pkgName, notification) ?: notification.smallIcon ?: return
+                                val iconKey = getIconCacheKey(smallIcon, pkgName) ?: "bmp_$pkgName"
+                                val cacheKey = "sb_$iconKey"
+
+                                // Return cached result if available
+                                descriptorCache[cacheKey]?.let { cached ->
+                                    iconField.set(result, cached)
+                                    return
+                                }
+
+                                var finalIcon: android.graphics.drawable.Icon = smallIcon
                                 val iconType = try { XposedHelpers.getIntField(smallIcon, "mType") } catch (_: Throwable) { -1 }
 
                                 if (iconType == 2) {
@@ -292,45 +341,54 @@ class HookEntry : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
                                     if (themedD != null && isColoredIcon(themedD.toBitmap())) {
                                         val rawD = loadIconWithoutTheme(smallIcon, pkgName, context)
-                                        if (rawD != null && !isColoredIcon(rawD.toBitmap())) {
-                                            iconField.set(result, smallIcon)
-                                        } else {
+                                        if (rawD == null || isColoredIcon(rawD.toBitmap())) {
                                             val d = rawD ?: themedD
-                                            val mono = ensureMonochrome(d)
-                                            iconField.set(result, android.graphics.drawable.Icon.createWithBitmap(mono.toBitmap()))
+                                            val mono = getCachedMonochrome(smallIcon, pkgName, d)
+                                            finalIcon = android.graphics.drawable.Icon.createWithBitmap(mono.toBitmap())
                                         }
-                                    } else {
-                                        iconField.set(result, smallIcon)
+                                        // else: rawD is monochrome — keep original resource icon (finalIcon = smallIcon)
                                     }
+                                    // else: themed drawable is already monochrome — keep original
                                 } else {
                                     // TYPE_BITMAP → try TYPE_RESOURCE from resId
                                     @Suppress("DEPRECATION")
                                     val resId = notification.icon
                                     if (resId != 0) {
                                         try {
-                                            val resIcon = android.graphics.drawable.Icon.createWithResource(pkgName, resId)
-                                            iconField.set(result, resIcon)
+                                            finalIcon = android.graphics.drawable.Icon.createWithResource(pkgName, resId)
                                         } catch (_: Throwable) {
                                             val pkgContext = try { context.createPackageContext(pkgName, 0) } catch (_: Throwable) { context }
                                             val d = smallIcon.loadDrawable(pkgContext)
                                             if (d != null) {
-                                                val mono = ensureMonochrome(d)
-                                                iconField.set(result, android.graphics.drawable.Icon.createWithBitmap(mono.toBitmap()))
+                                                val mono = getCachedMonochrome(smallIcon, pkgName, d)
+                                                finalIcon = android.graphics.drawable.Icon.createWithBitmap(mono.toBitmap())
                                             }
                                         }
                                     } else {
                                         val pkgContext = try { context.createPackageContext(pkgName, 0) } catch (_: Throwable) { context }
                                         val d = smallIcon.loadDrawable(pkgContext)
                                         if (d != null) {
-                                            val mono = ensureMonochrome(d)
-                                            iconField.set(result, android.graphics.drawable.Icon.createWithBitmap(mono.toBitmap()))
+                                            finalIcon = android.graphics.drawable.Icon.createWithBitmap(getCachedMonochrome(smallIcon, pkgName, d).toBitmap())
                                         }
                                     }
                                 }
+
+                                // Cache and set the result
+                                evictIfNeeded(descriptorCache, MAX_DESCRIPTOR_CACHE)
+                                descriptorCache[cacheKey] = finalIcon
+                                iconField.set(result, finalIcon)
                             } else {
                                 // Notification shade: colored app icon
+                                val shadeCacheKey = "shade_$pkgName"
+                                descriptorCache[shadeCacheKey]?.let { cached ->
+                                    iconField.set(result, cached)
+                                    return
+                                }
                                 val appIcon = context.packageManager.getApplicationIcon(pkgName)
-                                iconField.set(result, android.graphics.drawable.Icon.createWithBitmap(appIcon.toBitmap()))
+                                val appBitmapIcon = android.graphics.drawable.Icon.createWithBitmap(appIcon.toBitmap())
+                                evictIfNeeded(descriptorCache, MAX_DESCRIPTOR_CACHE)
+                                descriptorCache[shadeCacheKey] = appBitmapIcon
+                                iconField.set(result, appBitmapIcon)
                             }
                         } catch (t: Throwable) {
                             XposedBridge.log("$TAG SystemUI: ${t.message}")
@@ -416,7 +474,7 @@ class HookEntry : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             val sbn = param.args.getOrNull(0) ?: return
                             val pkg = XposedHelpers.callMethod(sbn, "getPackageName") as? String ?: return
                             val notification = XposedHelpers.callMethod(sbn, "getNotification") as? Notification ?: return
-                            val smallIcon = notification.smallIcon ?: return
+                            val smallIcon = customSmallIcon(pkg, notification) ?: notification.smallIcon ?: return
                             val layout = param.thisObject as android.view.ViewGroup
                             val count = layout.childCount
                             if (count == 0) return
@@ -424,7 +482,8 @@ class HookEntry : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             val context = layout.context
                             val pkgContext = try { context.createPackageContext(pkg, 0) } catch (_: Throwable) { context }
                             val iconDrawable = smallIcon.loadDrawable(pkgContext) ?: return
-                            lastChild.setImageDrawable(ensureMonochrome(iconDrawable))
+                            val mono = getCachedMonochrome(smallIcon, pkg, iconDrawable)
+                            lastChild.setImageDrawable(mono)
                         } catch (_: Throwable) {}
                     }
                 }
@@ -450,13 +509,13 @@ class HookEntry : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             val sbn = param.args.getOrNull(0) as? android.service.notification.StatusBarNotification ?: return
                             val pkg = XposedHelpers.callMethod(sbn, "getPackageName") as? String ?: return
                             val notification = XposedHelpers.callMethod(sbn, "getNotification") as? Notification ?: return
-                            val smallIcon = notification.smallIcon ?: return
+                            val smallIcon = customSmallIcon(pkg, notification) ?: notification.smallIcon ?: return
                             val view = param.thisObject
                             val paint = XposedHelpers.getObjectField(view, "mIncomingNotiPaint") ?: return
                             val context = XposedHelpers.getObjectField(paint, "mContext") as? android.content.Context ?: return
                             val pkgContext = try { context.createPackageContext(pkg, 0) } catch (_: Throwable) { context }
                             val iconDrawable = smallIcon.loadDrawable(pkgContext) ?: return
-                            val monoDrawable = ensureMonochrome(iconDrawable)
+                            val monoDrawable = getCachedMonochrome(smallIcon, pkg, iconDrawable)
                             val iconRect = XposedHelpers.getObjectField(paint, "mIconRect") as? android.graphics.Rect ?: return
                             monoDrawable.setBounds(iconRect)
                             XposedHelpers.setObjectField(paint, "mDrawable", monoDrawable)
@@ -544,18 +603,17 @@ class HookEntry : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             try {
                                 val rawDrawable = loadIconWithoutTheme(cachedIcon, pkg, context)
                                 if (rawDrawable != null) {
-                                    val rawBitmap = rawDrawable.toBitmap()
-                                    val rawMono = if (hasTransparency(rawBitmap)) {
-                                        toWhiteAlphaMask(rawBitmap)
-                                    } else {
-                                        ensureMonochrome(rawDrawable)
-                                    }
+                                    val rawMono = getCachedMonochrome(cachedIcon, pkg, rawDrawable, rawPath = true)
                                     val rawMonoBm = rawMono.toBitmap()
                                     if (!isBadSilhouette(rawMonoBm)) {
-                                        val fitted = fitToSize(rawMono, targetW, targetH, context.resources)
+                                        val baseKey = getIconCacheKey(cachedIcon, pkg) ?: "fallback_$pkg"
+                                        val fitted = fitToSize(rawMono, targetW, targetH, context.resources, "${baseKey}_raw")
                                         java.lang.reflect.Array.set(drawables, i, fitted)
                                         continue
                                     }
+                                    // Bad result — evict so themed path can cache its (possibly better) result
+                                    val baseKey = getIconCacheKey(cachedIcon, pkg) ?: "fallback_$pkg"
+                                    monochromeCache.remove("${baseKey}_raw")
                                 }
                             } catch (_: Throwable) {}
 
@@ -564,8 +622,9 @@ class HookEntry : IXposedHookLoadPackage, IXposedHookZygoteInit {
                                 val pkgContext = try { context.createPackageContext(pkg, 0) } catch (_: Throwable) { context }
                                 val smallDrawable = cachedIcon.loadDrawable(pkgContext)
                                 if (smallDrawable != null) {
-                                    val mono = ensureMonochrome(smallDrawable)
-                                    val fitted = fitToSize(mono, targetW, targetH, context.resources)
+                                    val mono = getCachedMonochrome(cachedIcon, pkg, smallDrawable)
+                                    val baseKey = getIconCacheKey(cachedIcon, pkg) ?: "fallback_$pkg"
+                                    val fitted = fitToSize(mono, targetW, targetH, context.resources, baseKey)
                                     java.lang.reflect.Array.set(drawables, i, fitted)
                                     continue
                                 }
@@ -574,7 +633,7 @@ class HookEntry : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
                         // Fallback: monochrome from original colored icon
                         if (originalDrawable != null) {
-                            val mono = ensureMonochrome(originalDrawable)
+                            val mono = getCachedMonochromeFallback(pkg, originalDrawable)
                             java.lang.reflect.Array.set(drawables, i, mono)
                         }
                     }
@@ -595,10 +654,10 @@ class HookEntry : IXposedHookLoadPackage, IXposedHookZygoteInit {
                     if (showList.size >= 6) return
 
                     val notification = XposedHelpers.callMethod(sbn, "getNotification") as? Notification ?: return
-                    val smallIcon = notification.smallIcon ?: return
+                    val smallIcon = customSmallIcon(pkg, notification) ?: notification.smallIcon ?: return
                     val context = XposedHelpers.getObjectField(param.thisObject, "mContext") as? android.content.Context ?: return
                     val drawable = smallIcon.loadDrawable(context) ?: return
-                    val monoDrawable = ensureMonochrome(drawable)
+                    val monoDrawable = getCachedMonochrome(smallIcon, pkg, drawable)
 
                     try {
                         val roundedBitmap = XposedHelpers.callMethod(
@@ -667,10 +726,46 @@ class HookEntry : IXposedHookLoadPackage, IXposedHookZygoteInit {
     //  Utility
     // ═══════════════════════════════════════════════
 
+    /** Cache key for TYPE_RESOURCE Icon: "r_resPkg_resId". Returns null for TYPE_BITMAP (no cheap key). */
+    private fun getIconCacheKey(icon: android.graphics.drawable.Icon, pkg: String): String? {
+        try {
+            val type = XposedHelpers.getIntField(icon, "mType")
+            if (type != 2) return null
+            val resId = try {
+                icon.javaClass.getDeclaredMethod("getResId").apply { isAccessible = true }.invoke(icon) as Int
+            } catch (_: Throwable) { XposedHelpers.getIntField(icon, "mInt1") }
+            if (resId == 0) return null
+            val resPkg = try {
+                icon.javaClass.getDeclaredMethod("getResPackage").apply { isAccessible = true }.invoke(icon) as? String
+            } catch (_: Throwable) { try { XposedHelpers.getObjectField(icon, "mString1") as? String } catch (_: Throwable) { null } } ?: pkg
+            return "r_${resPkg}_$resId"
+        } catch (_: Throwable) { return null }
+    }
+
+    /**
+     * Returns cached monochrome drawable or computes and caches.
+     * For TYPE_RESOURCE: caches by (resPkg, resId). For TYPE_BITMAP: caches by pkg only.
+     * rawPath=true: key gets "_raw" suffix (loadIconWithoutTheme result ≠ themed loadDrawable).
+     * Returns a copy (constantState.newDrawable) so callers can mutate (setBounds) safely.
+     */
+    private fun getCachedMonochrome(icon: android.graphics.drawable.Icon?, pkg: String, drawable: Drawable, rawPath: Boolean = false): Drawable {
+        val baseKey = icon?.let { getIconCacheKey(it, pkg) } ?: "fallback_$pkg"
+        val key = if (rawPath) "${baseKey}_raw" else baseKey
+        evictIfNeeded(monochromeCache, MAX_MONOCHROME_CACHE)
+        val cached = monochromeCache.getOrPut(key) { ensureMonochrome(drawable) }
+        return cached.constantState?.newDrawable()?.mutate() ?: cached
+    }
+
+    /** Fallback cache for drawables without Icon (e.g. AOD app icon). Key: pkg only. */
+    private fun getCachedMonochromeFallback(pkg: String, drawable: Drawable): Drawable {
+        return getCachedMonochrome(null, pkg, drawable)
+    }
+
     /**
      * Load Icon resource WITHOUT OxygenOS theme.
      * OxygenOS themes resources (e.g. battery) into colored bitmaps.
      * Loading with null theme returns the original Android resource (usually monochrome VectorDrawable).
+     * Cached by (resPkg, resId) to avoid repeated resource loading.
      */
     private fun loadIconWithoutTheme(icon: android.graphics.drawable.Icon, pkg: String, context: android.content.Context): Drawable? {
         try {
@@ -694,17 +789,28 @@ class HookEntry : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 try { XposedHelpers.getObjectField(icon, "mString1") as? String } catch (_: Throwable) { null }
             } ?: pkg
 
+            val key = "raw_${resPkg}_$resId"
+            evictIfNeeded(rawIconCache, MAX_RAW_ICON_CACHE)
+            rawIconCache[key]?.let { cached ->
+                return cached.constantState?.newDrawable()?.mutate() ?: cached
+            }
             val pkgCtx = context.createPackageContext(resPkg, android.content.Context.CONTEXT_IGNORE_SECURITY)
-            return pkgCtx.resources.getDrawable(resId, null)
+            val d = pkgCtx.resources.getDrawable(resId, null) ?: return null
+            rawIconCache[key] = d
+            return d.constantState?.newDrawable()?.mutate() ?: d
         } catch (_: Throwable) {
             return null
         }
     }
 
     private fun looksLikePackageName(s: String): Boolean {
-        if (s.length < 3 || s.startsWith("http", ignoreCase = true)) return false
-        if (java.io.File(s).exists()) return false
-        return s.contains(".") && s[0].isLetter()
+        if (s.length < 3 || !s[0].isLetter()) return false
+        if (!s.contains('.')) return false
+        // Heuristic: reject URLs and file paths without expensive filesystem I/O
+        if (s.startsWith("http", ignoreCase = true) || s.startsWith("/") || s.contains("://")) return false
+        if (s.contains('/') || s.contains('\\')) return false
+        if (s.endsWith(".apk", ignoreCase = true) || s.endsWith(".dex", ignoreCase = true)) return false
+        return true
     }
 
     /** Check if icon bitmap has significant color saturation. */
@@ -961,14 +1067,30 @@ class HookEntry : IXposedHookLoadPackage, IXposedHookZygoteInit {
         return BitmapDrawable(android.content.res.Resources.getSystem(), result)
     }
 
-    /** Scale drawable to target dimensions. */
-    private fun fitToSize(drawable: Drawable, targetW: Int, targetH: Int, res: android.content.res.Resources): Drawable {
+    /** Scale drawable to target dimensions. Cached when cacheKey provided. */
+    private fun fitToSize(drawable: Drawable, targetW: Int, targetH: Int, res: android.content.res.Resources, cacheKey: String? = null): Drawable {
         if (targetW <= 0 || targetH <= 0) return drawable
+        val key = cacheKey?.let { "fit_${it}_${targetW}_${targetH}" }
+        if (key != null) {
+            evictIfNeeded(fitCache, MAX_FIT_CACHE)
+            fitCache[key]?.let { cached ->
+                return cached.constantState?.newDrawable()?.mutate() ?: cached
+            }
+        }
         val bitmap = drawable.toBitmap()
         if (bitmap.width == targetW && bitmap.height == targetH) return drawable
         val scaled = Bitmap.createScaledBitmap(bitmap, targetW, targetH, true)
         scaled.density = bitmap.density
-        return BitmapDrawable(res, scaled)
+        val result = BitmapDrawable(res, scaled)
+        key?.let { fitCache[it] = result }
+        return result.constantState?.newDrawable()?.mutate() ?: result
+    }
+
+    /** Evict oldest entries from a ConcurrentHashMap when it exceeds maxSize. */
+    private fun <K, V> evictIfNeeded(cache: java.util.concurrent.ConcurrentHashMap<K, V>, maxSize: Int) {
+        if (cache.size >= maxSize) {
+            cache.keys.toList().take(maxSize / 4).forEach { cache.remove(it) }
+        }
     }
 
     /** Desaturation fallback for legacy calls. */

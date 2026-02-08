@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="24"
+     height="24"
+     viewBox="0 0 24 24">
+
+  <!-- Outer shield -->
+  <path d="M12 1
+           L3 4.2
+           V11.3
+           C3 16.1 6.7 19.8 12 23
+           C17.3 19.8 21 16.1 21 11.3
+           V4.2
+           Z"
+        fill="none"
+        stroke="black"
+        stroke-width="1.9"
+        stroke-linejoin="round"/>
+
+  <!-- Material-style lightning bolt -->
+  <path d="M13.2 5.1
+           L9.6 12.3
+           H12
+           L10.8 18.3
+           L14.4 11.1
+           H12
+           L13.2 5.1
+           Z"
+        fill="black"/>
+</svg>
