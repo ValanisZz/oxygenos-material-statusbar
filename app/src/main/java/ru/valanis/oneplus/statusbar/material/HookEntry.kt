@@ -47,6 +47,8 @@ class HookEntry : IXposedHookLoadPackage, IXposedHookZygoteInit {
             "com.oplus.battery" to ru.valanis.oneplus.statusbar.material.R.drawable.ic_notify_battery_full,
             "com.oplus.phonemanager" to ru.valanis.oneplus.statusbar.material.R.drawable.ic_notify_phonemanager,
             "com.oneplus.deskclock" to ru.valanis.oneplus.statusbar.material.R.drawable.ic_notify_deskclock,
+			"com.android.providers.donwloads" to ru.valanis.oneplus.statusbar.material.R.drawable.ic_notify_download,
+			"com.oplus.ota" to ru.valanis.oneplus.statusbar.material.R.drawable.ic_notify_ota,
         )
     }
 

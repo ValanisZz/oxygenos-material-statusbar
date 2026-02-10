@@ -12,7 +12,7 @@ android {
         minSdk 26
         targetSdk 34
         versionCode 160002
-        versionName "16.1"
+        versionName "16.2"
     }
 
     signingConfigs {
