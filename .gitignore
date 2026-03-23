@@ -1,11 +1,14 @@
 *.iml
 *.log
 .gradle
+.idea
 .DS_Store
 .externalNativeBuild
 .cxx
+local.properties
 
 /apk
 /build
 
 /app/build
+/Settings.apk

@@ -1,0 +1,6 @@
+<animated-vector xmlns:android="http://schemas.android.com/apk/res/android" xmlns:aapt="http://schemas.android.com/aapt" android:drawable="@7F080E11">
+  <set android:interpolator="@7F0C000C" android:shareInterpolator="true">
+    <target android:name="@7F141B97" android:animation="@7F0802A5"/>
+    <target android:name="@7F141B97" android:animation="@7F0802A6"/>
+  </set>
+</animated-vector>

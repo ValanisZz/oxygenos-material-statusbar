@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OxygenOS Material Icons</string>
+    <string name="xposed_description">Возвращает Material-стиль иконок уведомлений на OxygenOS 16.\n• Строка состояния: монохромные small icon (автотинт светлый↔темный)\n• Шторка уведомлений: цветные иконки приложений\n• AOD: монохромные белые силуэты</string>
+    <string name="settings_entry_title">Иконки Material</string>
+    <string name="pref_enable_module">Включить внедрение в SystemUI</string>
+    <string name="pref_status_bar">Строка состояния</string>
+    <string name="pref_status_bar_desc">Использовать Material адаптивные иконки в строке состояния</string>
+    <string name="pref_shade">Шторка уведомлений</string>
+    <string name="pref_shade_desc">Использовать Material адаптивные иконки в шторке уведомлений</string>
+    <string name="pref_aod">Всегда включенный дисплей (AOD)</string>
+    <string name="pref_aod_desc">Использовать Material адаптивные иконки в режиме постоянно включенного дисплея</string>
+    <string name="pref_notification_categories">Индивидуальные значки для категорий уведомлений</string>
+    <string name="pref_notification_categories_desc">Включите эту опцию, чтобы в настройках уведомлений каждого приложения появилась возможность выбрать собственную иконку для каждой категории уведомлений (например, для сообщений, звонков, напоминаний и т. д.)</string>
+    <string name="pref_custom_icons">Авторские иконки для системных приложений</string>
+    <string name="pref_custom_icons_desc">Включите эту опцию, чтобы заменить стандартные значки некоторых системных приложений на адаптивные авторские иконки в стиле Material</string>
+    <string name="pref_coming_soon">Будет реализовано в следующей версии</string>
+    <string name="btn_restart_systemui">Применить изменения и перезапустить SystemUI</string>
+    <string name="msg_saved">Применить все ранее сделанные изменения, требующие перезагрузки оболочки системы. SystemUI будет перезапущен — экран на мгновение погаснет или интерфейс временно пропадёт, затем восстановится в обычном режиме.</string>
+</resources>
