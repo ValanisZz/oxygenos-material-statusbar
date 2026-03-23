@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <item type="id" name="checked" />
+    <item type="id" name="pressed" />
+    <item type="id" name="unchecked" />
+    <item type="id" name="with_icon" />
+</resources>
