@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(adb -s 3B15CF00P2800000 shell dumpsys notification --noredact)",
+      "Bash(adb:*)",
+      "Bash(./gradlew assembleDebug)",
+      "Bash(adb -s 3B15CF00P2800000 shell su -c \"grep -i ''''OxygenOS\\\\|Material\\\\|channel\\\\|valanis'''' /data/adb/lspd/log/modules_2026-03-23T08:00:20.124317.log\")",
+      "Bash(adb -s 3B15CF00P2800000 shell su -c \"grep ''''OxygenOS'''' /data/adb/lspd/log/modules_2026-03-23T08:00:20.124317.log\")",
+      "Bash(grep -oa '[a-zA-Z][a-zA-Z0-9._/$]*')"
+    ]
+  }
+}

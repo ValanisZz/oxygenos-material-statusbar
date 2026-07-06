@@ -60,14 +60,35 @@ object PreferenceUtils {
         if (now - lastReloadMs.get() < 2000L) return
         lastReloadMs.set(now)
 
-        if (tryLoadFromSettingsGlobal()) return
-        if (tryLoadFromFile(PREFS_PATH)) return
-        @Suppress("DEPRECATION")
-        if (tryLoadFromFile(LEGACY_PREFS_PATH)) return
-        tryLoadFromXsp()
+        /**
+         * Раньше при любом непустом Settings.Global делали return и **не читали** XML модуля.
+         * В Global часто есть только часть ключей → остальные брали default (у категорийных иконок false)
+         * и инъекция в `com.oplus.notificationmanager` **молча не работала**.
+         * Сейчас: база из файла/XSP, поверх — оверлей Global.
+         */
+        val merged = ConcurrentHashMap<String, Boolean>()
+        tryLoadFromFileInto(PREFS_PATH, merged)
+        if (merged.isEmpty()) {
+            @Suppress("DEPRECATION")
+            tryLoadFromFileInto(LEGACY_PREFS_PATH, merged)
+        }
+        if (merged.isEmpty()) {
+            tryLoadFromXspInto(merged)
+        }
+        mergeSettingsGlobalInto(merged)
+        if (merged.isNotEmpty()) {
+            if (!loggedOnce) {
+                loggedOnce = true
+                XposedBridge.log("$TAG Prefs merged (file/XSP + Global overlay): $merged")
+            }
+            cached = merged
+        } else {
+            tryLoadFromSettingsGlobalOnly()
+        }
     }
 
-    private fun tryLoadFromSettingsGlobal(): Boolean {
+    /** Только Global — если файла/XSP нет (редко). */
+    private fun tryLoadFromSettingsGlobalOnly(): Boolean {
         val resolver = getSystemResolver() ?: return false
         try {
             val map = ConcurrentHashMap<String, Boolean>()
@@ -78,7 +99,7 @@ object PreferenceUtils {
             if (map.isNotEmpty()) {
                 if (!loggedOnce) {
                     loggedOnce = true
-                    XposedBridge.log("$TAG Prefs loaded from Settings.Global: $map")
+                    XposedBridge.log("$TAG Prefs loaded from Settings.Global only: $map")
                 }
                 cached = map
                 return true
@@ -89,47 +110,65 @@ object PreferenceUtils {
         return false
     }
 
-    private fun tryLoadFromFile(path: String): Boolean {
+    private fun mergeSettingsGlobalInto(map: ConcurrentHashMap<String, Boolean>) {
+        val resolver = getSystemResolver() ?: return
+        try {
+            for (key in KNOWN_KEYS) {
+                val value = Settings.Global.getInt(resolver, globalKey(key), -1)
+                if (value != -1) map[key] = value == 1
+            }
+        } catch (t: Throwable) {
+            if (!loggedOnce) XposedBridge.log("$TAG Prefs Settings.Global merge: ${t.message}")
+        }
+    }
+
+    private fun parseBoolXmlInto(xml: String, target: ConcurrentHashMap<String, Boolean>) {
+        for (match in boolRegex.findAll(xml)) {
+            target[match.groupValues[1]] = match.groupValues[2].toBoolean()
+        }
+    }
+
+    private fun tryLoadFromFileInto(path: String, target: ConcurrentHashMap<String, Boolean>): Boolean {
         try {
             val file = File(path)
-            if (!file.canRead()) {
+            val xml = if (file.canRead()) {
+                file.readText()
+            } else {
                 if (!loggedOnce) XposedBridge.log("$TAG Prefs: $path canRead=false")
-                return false
+                readPrefsFileViaSu(path) ?: return false
             }
-            val xml = file.readText()
-            val map = ConcurrentHashMap<String, Boolean>()
-            for (match in boolRegex.findAll(xml)) {
-                map[match.groupValues[1]] = match.groupValues[2].toBoolean()
-            }
-            if (map.isNotEmpty()) {
-                if (!loggedOnce) {
-                    loggedOnce = true
-                    XposedBridge.log("$TAG Prefs loaded from $path: $map")
-                }
-                cached = map
-                return true
-            }
+            parseBoolXmlInto(xml, target)
+            if (target.isNotEmpty()) return true
         } catch (t: Throwable) {
             if (!loggedOnce) XposedBridge.log("$TAG Prefs error($path): ${t.message}")
         }
-        return false
+        return readPrefsFileViaSu(path)?.let { suXml ->
+            parseBoolXmlInto(suXml, target)
+            target.isNotEmpty()
+        } ?: false
     }
 
-    private fun tryLoadFromXsp() {
+    /** Как [ru.valanis.oneplus.hook.settings.SettingsScreenBuilder.readViaSu] — чтение prefs с root. */
+    private fun readPrefsFileViaSu(path: String): String? {
+        return try {
+            val process = Runtime.getRuntime().exec(
+                arrayOf("su", "-c", "cat '$path' 2>/dev/null")
+            )
+            val xml = process.inputStream.bufferedReader().readText()
+            process.waitFor()
+            xml.takeIf { it.isNotBlank() }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun tryLoadFromXspInto(target: ConcurrentHashMap<String, Boolean>) {
         try {
             val xsp = xspFallback ?: return
             xsp.reload()
             if (xsp.all.isEmpty()) return
-            val map = ConcurrentHashMap<String, Boolean>()
             for ((key, value) in xsp.all) {
-                if (value is Boolean) map[key] = value
-            }
-            if (map.isNotEmpty()) {
-                if (!loggedOnce) {
-                    loggedOnce = true
-                    XposedBridge.log("$TAG Prefs loaded from XSP: $map")
-                }
-                cached = map
+                if (value is Boolean) target[key] = value
             }
         } catch (t: Throwable) {
             if (!loggedOnce) XposedBridge.log("$TAG Prefs XSP error: ${t.message}")
@@ -165,4 +204,10 @@ object PreferenceUtils {
         ModulePreferences.KEY_ENABLE_CUSTOM_ICONS,
         ModulePreferences.DEFAULT_ENABLE_CUSTOM_ICONS
     )
+
+    fun isNotificationCategoryIconsEnabled(): Boolean = isModuleEnabled() && prefBoolean(
+        ModulePreferences.KEY_ENABLE_NOTIFICATION_CATEGORY_ICONS,
+        ModulePreferences.DEFAULT_ENABLE_NOTIFICATION_CATEGORY_ICONS
+    )
+
 }

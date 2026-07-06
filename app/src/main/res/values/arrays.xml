@@ -5,5 +5,7 @@
         <item>com.android.systemui</item>
         <item>com.oplus.aod</item>
         <item>com.android.settings</item>
+        <!-- Oplus: экран канала — ChannelNotificationSettingsActivity в NotificationCenter, не в Settings.apk -->
+        <item>com.oplus.notificationmanager</item>
     </string-array>
 </resources>

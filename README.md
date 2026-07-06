@@ -146,3 +146,21 @@
 - `ensureMonochrome(Drawable)` — конвертация в белый силуэт (AdaptiveIcon, прозрачные/непрозрачные иконки).
 - `iconCache` — ConcurrentHashMap<String, Icon>, заполняется в SBN-хуках, используется в AOD.
 - `engineHooked` — AtomicBoolean, чтобы хукать AOD engine только один раз.
+
+## Отладка: экран канала (иконка категории) и logcat
+
+Логи с телефона в репозиторий не попадают — их нужно снять через ADB и при необходимости приложить к issue.
+
+```bash
+adb logcat -s OxygenOSMaterialIcons:V XposedBridge:V
+```
+
+Или полный дамп с фильтром по строке:
+
+```bash
+adb logcat -d | findstr /i "OxygenOSMaterialIcons channelIcon Xposed"
+```
+
+Полезные сообщения: `Prefs merged` (настройки загружены), `channelIcon: defer`, `injected for`, `abort` (причина: app-level / prefs / нет PreferenceScreen).
+
+**Важно:** в настройках модуля должны быть включены **модуль** и **иконки по категориям уведомлений**; после правок prefs перезапустите `com.oplus.notificationmanager` (или перезагрузка).

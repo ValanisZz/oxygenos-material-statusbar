@@ -5,9 +5,11 @@ import android.content.Context
 import android.content.res.Resources
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.drawable.AdaptiveIconDrawable
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
@@ -17,7 +19,11 @@ import androidx.core.graphics.drawable.toDrawable
 import androidx.core.graphics.get
 import androidx.core.graphics.scale
 import de.robv.android.xposed.XposedHelpers
+import org.xmlpull.v1.XmlPullParser
+import org.xmlpull.v1.XmlPullParserFactory
 import ru.valanis.oneplus.statusbar.material.R
+import java.io.File
+import java.io.StringReader
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.max
 import kotlin.math.pow
@@ -48,15 +54,313 @@ object IconUtils {
     private val rawIconCache = ConcurrentHashMap<String, Drawable>()
     val descriptorCache = ConcurrentHashMap<String, Icon>()
 
+    private val channelDrawableByPath = ConcurrentHashMap<String, Drawable>()
+
+    private fun applicationContextOrNull(): Context? {
+        return try {
+            val clazz = Class.forName("android.app.ActivityThread")
+            clazz.getMethod("currentApplication").invoke(null) as? Context
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
     fun clearAllCaches() {
         iconCache.clear()
         monochromeCache.clear()
         fitCache.clear()
         rawIconCache.clear()
         descriptorCache.clear()
+        channelDrawableByPath.clear()
+        ChannelIconStore.invalidateCache()
     }
 
-    fun customSmallIcon(pkg: String, notification: Notification? = null): Icon? {
+    /**
+     * Clears all bitmap-keyed cache entries for [pkg] so a freshly patched channel-override
+     * icon is rendered correctly instead of stale monochrome / fitted variants.
+     * Called from [ru.valanis.oneplus.hook.systemui.AodHook.tryEarlyPatch] after patching.
+     */
+    fun clearPackageBitmapCaches(pkg: String) {
+        val prefix = "fallback_$pkg"
+        monochromeCache.keys.removeIf { it.startsWith(prefix) }
+        fitCache.keys.removeIf { it.contains(prefix) }
+    }
+
+    private const val ANDROID_NS = "http://schemas.android.com/apk/res/android"
+
+    /**
+     * Reads file content with su fallback (SystemUI can't read /sdcard directly due to SELinux).
+     */
+    private fun readFileBytes(path: String): ByteArray? {
+        try {
+            val file = File(path)
+            if (file.canRead()) return file.readBytes()
+            android.util.Log.e("OxygenOSMaterialIcons", "readFileBytes: canRead=false path=$path")
+        } catch (_: Throwable) {}
+        return try {
+            val process = Runtime.getRuntime().exec(
+                arrayOf("su", "-c", "cat '$path' 2>/dev/null")
+            )
+            val bytes = process.inputStream.readBytes()
+            process.waitFor()
+            val result = bytes.takeIf { it.isNotEmpty() }
+            if (result == null) android.util.Log.e("OxygenOSMaterialIcons", "readFileBytes: su empty for $path")
+            result
+        } catch (t: Throwable) {
+            android.util.Log.e("OxygenOSMaterialIcons", "readFileBytes: su failed for $path: ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * Loads a drawable from an on-disk file (user-provided path).
+     * Supports VectorDrawable XML and bitmap formats (PNG, WebP, JPG).
+     */
+    fun loadDrawableFromXmlPath(path: String, context: Context): Drawable? {
+        return try {
+            val file = File(path)
+            val cacheKey = "${path}:${file.lastModified()}"
+            channelDrawableByPath[cacheKey]?.let { d ->
+                return d.constantState?.newDrawable()?.mutate() ?: d
+            }
+            val bytes = readFileBytes(path) ?: return null
+            val drawable = when {
+                path.endsWith(".xml", ignoreCase = true) ->
+                    parseVectorDrawableXml(String(bytes, Charsets.UTF_8), context)
+                path.endsWith(".svg", ignoreCase = true) ->
+                    parseSvgXml(String(bytes, Charsets.UTF_8), context)
+                else -> {
+                    val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        ?: return null
+                    BitmapDrawable(context.resources, bmp)
+                }
+            }
+            if (drawable == null) return null
+            val mutable = drawable.mutate()
+            evictIfNeeded(channelDrawableByPath, 40)
+            channelDrawableByPath[cacheKey] = mutable
+            mutable.constantState?.newDrawable()?.mutate() ?: mutable
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * Parses a VectorDrawable text XML and renders it to a Bitmap.
+     * Drawable.createFromXml() doesn't work with plain text XML because VectorDrawable
+     * requires compiled (binary) XML with resolved attribute resource IDs.
+     */
+    private fun parseVectorDrawableXml(xmlContent: String, context: Context): Drawable? {
+        val parser = XmlPullParserFactory.newInstance().apply { isNamespaceAware = true }.newPullParser()
+        parser.setInput(StringReader(xmlContent))
+
+        var viewportW = 24f
+        var viewportH = 24f
+        val paths = mutableListOf<Triple<Path, Paint, Paint?>>() // path, fill, stroke
+
+        while (parser.next() != XmlPullParser.END_DOCUMENT) {
+            if (parser.eventType != XmlPullParser.START_TAG) continue
+            when (parser.name) {
+                "vector" -> {
+                    viewportW = parser.getAttributeValue(ANDROID_NS, "viewportWidth")?.toFloatOrNull() ?: 24f
+                    viewportH = parser.getAttributeValue(ANDROID_NS, "viewportHeight")?.toFloatOrNull() ?: 24f
+                }
+                "path" -> {
+                    val pathData = parser.getAttributeValue(ANDROID_NS, "pathData") ?: continue
+                    val path = createPathFromData(pathData) ?: continue
+                    val fillColorStr = parser.getAttributeValue(ANDROID_NS, "fillColor")
+                    val strokeColorStr = parser.getAttributeValue(ANDROID_NS, "strokeColor")
+                    val strokeWidthStr = parser.getAttributeValue(ANDROID_NS, "strokeWidth")
+
+                    val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        style = Paint.Style.FILL
+                        color = parseColorValue(fillColorStr) ?: Color.BLACK
+                    }
+                    val strokePaint = if (strokeColorStr != null) {
+                        Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                            style = Paint.Style.STROKE
+                            color = parseColorValue(strokeColorStr) ?: Color.TRANSPARENT
+                            strokeWidth = strokeWidthStr?.toFloatOrNull() ?: 1f
+                        }
+                    } else null
+                    paths.add(Triple(path, fillPaint, strokePaint))
+                }
+            }
+        }
+
+        if (paths.isEmpty()) return null
+
+        val density = context.resources.displayMetrics.density
+        val size = (24 * density).toInt().coerceAtLeast(48)
+        val bitmap = createBitmap(size, size)
+        val canvas = Canvas(bitmap)
+        canvas.scale(size / viewportW, size / viewportH)
+        for ((path, fill, stroke) in paths) {
+            canvas.drawPath(path, fill)
+            if (stroke != null) canvas.drawPath(path, stroke)
+        }
+        return BitmapDrawable(context.resources, bitmap)
+    }
+
+    /**
+     * Minimal SVG parser supporting `<path d="...">` elements with fill/stroke attributes.
+     * SVG path data (`d`) uses the same syntax as Android VectorDrawable `pathData`,
+     * so we reuse PathParser. Groups (`<g>`) are traversed but transforms are ignored.
+     */
+    private fun parseSvgXml(xmlContent: String, context: Context): Drawable? {
+        val parser = XmlPullParserFactory.newInstance().apply { isNamespaceAware = true }.newPullParser()
+        parser.setInput(StringReader(xmlContent))
+
+        var viewportW = 24f
+        var viewportH = 24f
+        val paths = mutableListOf<Triple<Path, Paint, Paint?>>()
+
+        // Inherit fill from ancestor <g> elements; SVG default fill is black
+        val fillStack = ArrayDeque<String?>()
+        fillStack.addLast(null) // root default: black
+
+        while (parser.next() != XmlPullParser.END_DOCUMENT) {
+            when (parser.eventType) {
+                XmlPullParser.START_TAG -> when (parser.name.lowercase()) {
+                    "svg" -> {
+                        val viewBox = parser.getAttributeValue(null, "viewBox")
+                        if (viewBox != null) {
+                            val parts = viewBox.trim().split(Regex("[,\\s]+"))
+                            if (parts.size >= 4) {
+                                viewportW = parts[2].toFloatOrNull() ?: 24f
+                                viewportH = parts[3].toFloatOrNull() ?: 24f
+                            }
+                        } else {
+                            viewportW = parser.getAttributeValue(null, "width")
+                                ?.replace(Regex("[^0-9.]"), "")?.toFloatOrNull() ?: 24f
+                            viewportH = parser.getAttributeValue(null, "height")
+                                ?.replace(Regex("[^0-9.]"), "")?.toFloatOrNull() ?: 24f
+                        }
+                    }
+                    "g" -> {
+                        // Push inherited fill from group (null = inherit from parent)
+                        val gFill = parser.getAttributeValue(null, "fill")
+                            ?: parseSvgStyleAttr(parser.getAttributeValue(null, "style") ?: "")["fill"]
+                        fillStack.addLast(gFill)
+                    }
+                    "path" -> {
+                        val d = parser.getAttributeValue(null, "d") ?: continue
+                        val svgPath = createPathFromData(d) ?: continue
+
+                        val styleMap = parseSvgStyleAttr(parser.getAttributeValue(null, "style") ?: "")
+                        val fillStr = styleMap["fill"]
+                            ?: parser.getAttributeValue(null, "fill")
+                            ?: fillStack.lastOrNull { it != null } // inherit from g ancestors
+                        val strokeStr = styleMap["stroke"] ?: parser.getAttributeValue(null, "stroke")
+                        val strokeWidthStr = styleMap["stroke-width"] ?: parser.getAttributeValue(null, "stroke-width")
+
+                        val fillColor = when {
+                            fillStr == "none" -> null
+                            fillStr != null -> parseSvgColor(fillStr)
+                            else -> Color.BLACK // SVG default
+                        }
+                        val strokeColor = when {
+                            strokeStr == "none" || strokeStr == null -> null
+                            else -> parseSvgColor(strokeStr)
+                        }
+
+                        if (fillColor != null || strokeColor != null) {
+                            val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                                style = Paint.Style.FILL
+                                color = fillColor ?: Color.TRANSPARENT
+                            }
+                            val strokePaint = strokeColor?.let {
+                                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                                    style = Paint.Style.STROKE
+                                    color = it
+                                    strokeWidth = strokeWidthStr?.replace(Regex("[^0-9.]"), "")
+                                        ?.toFloatOrNull() ?: 1f
+                                }
+                            }
+                            paths.add(Triple(svgPath, fillPaint, strokePaint))
+                        }
+                    }
+                }
+                XmlPullParser.END_TAG -> if (parser.name.lowercase() == "g") {
+                    if (fillStack.size > 1) fillStack.removeLast()
+                }
+            }
+        }
+
+        if (paths.isEmpty()) {
+            android.util.Log.e("OxygenOSMaterialIcons", "parseSvgXml: no renderable paths found (vp=${viewportW}x${viewportH})")
+            return null
+        }
+
+        val density = context.resources.displayMetrics.density
+        val size = (24 * density).toInt().coerceAtLeast(48)
+        val bitmap = createBitmap(size, size)
+        val canvas = Canvas(bitmap)
+        canvas.scale(size / viewportW, size / viewportH)
+        for ((path, fill, stroke) in paths) {
+            if (fill.color != Color.TRANSPARENT) canvas.drawPath(path, fill)
+            if (stroke != null) canvas.drawPath(path, stroke)
+        }
+        return BitmapDrawable(context.resources, bitmap)
+    }
+
+    private fun parseSvgStyleAttr(style: String): Map<String, String> {
+        val map = mutableMapOf<String, String>()
+        for (decl in style.split(';')) {
+            val parts = decl.trim().split(':', limit = 2)
+            if (parts.size == 2) map[parts[0].trim().lowercase()] = parts[1].trim()
+        }
+        return map
+    }
+
+    private fun parseSvgColor(colorStr: String): Int? =
+        try { Color.parseColor(colorStr.trim()) } catch (_: Throwable) { null }
+
+    private fun createPathFromData(pathData: String): Path? {
+        return try {
+            val parserClass = Class.forName("android.util.PathParser")
+            parserClass.getMethod("createPathFromPathData", String::class.java)
+                .invoke(null, pathData) as? Path
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun parseColorValue(colorStr: String?): Int? {
+        if (colorStr.isNullOrEmpty()) return null
+        return try {
+            Color.parseColor(colorStr)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * @param variant "main" (status bar), "shade" (notification shade), or "aod".
+     *   Shade and AOD fall back to the main icon if no variant-specific path is stored.
+     */
+    fun channelOverrideIcon(
+        pkg: String,
+        channelId: String,
+        context: Context,
+        variant: String = "main"
+    ): Icon? {
+        if (!PreferenceUtils.isNotificationCategoryIconsEnabled()) return null
+        if (channelId.isEmpty()) return null
+        val path = when (variant) {
+            "shade" -> ChannelIconStore.getShadePath(pkg, channelId)
+            "aod"   -> ChannelIconStore.getAodPath(pkg, channelId)
+            else    -> { ChannelIconStore.reload(); ChannelIconStore.getPath(pkg, channelId) }
+        } ?: return null
+        val d = loadDrawableFromXmlPath(path, context)
+        if (d == null) {
+            android.util.Log.e("OxygenOSMaterialIcons", "channelOverrideIcon[$pkg/$channelId/$variant]: drawable=null path=$path")
+            return null
+        }
+        return Icon.createWithBitmap(d.toBitmap())
+    }
+
+    fun customSmallIcon(pkg: String, notification: Notification? = null, context: Context? = null): Icon? {
         if (!PreferenceUtils.isModuleEnabled()) return null
 
         val resId = CUSTOM_SMALL_ICONS[pkg]

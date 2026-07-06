@@ -1,12 +1,15 @@
 package ru.valanis.oneplus.hook.systemui
 
 import android.annotation.SuppressLint
+import android.app.Notification
 import android.graphics.drawable.Drawable
 import android.widget.ImageView
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import ru.valanis.oneplus.hook.core.ChannelIconStore
+import ru.valanis.oneplus.hook.core.IconUtils
 import ru.valanis.oneplus.hook.core.PreferenceUtils
 import java.lang.reflect.Method
 import java.util.concurrent.ConcurrentHashMap
@@ -49,7 +52,18 @@ object ShadeHook {
                 }
                 val sbn = getSbn.invoke(entry) ?: return
                 val pkg = XposedHelpers.callMethod(sbn, "getPackageName") as? String ?: return
+                val notification = XposedHelpers.callMethod(sbn, "getNotification") as? Notification
+                val channelId = try { notification?.channelId } catch (_: Throwable) { null } ?: ""
 
+                if (channelId.isNotEmpty() && ChannelIconStore.getShadePath(pkg, channelId) != null) {
+                    // Always set channel icon explicitly — guarantees correct icon even on first draw
+                    val channelIcon = IconUtils.channelOverrideIcon(pkg, channelId, mIcon.context, "shade")
+                    val d = channelIcon?.loadDrawable(mIcon.context)
+                    if (d != null) {
+                        mIcon.setImageDrawable(d)
+                        return
+                    }
+                }
                 mIcon.setImageDrawable(getCachedAppIcon(pkg, mIcon.context))
             } catch (_: Throwable) {}
         }
@@ -57,7 +71,8 @@ object ShadeHook {
         val pairs = listOf(
             "com.oplus.systemui.statusbar.notification.row.wrapper.OplusNotificationHeaderViewWrapperExImp" to "proxyOnContentUpdated",
             "com.android.systemui.statusbar.notification.row.wrapper.NotificationHeaderViewWrapper" to "onContentUpdated",
-            "com.android.systemui.statusbar.notification.NotificationHeaderViewWrapper" to "onContentUpdated"
+            "com.android.systemui.statusbar.notification.NotificationHeaderViewWrapper" to "onContentUpdated",
+            "com.oplus.systemui.notification.row.oplusgroup.OplusNotificationGroupTemplateWrapper" to "onContentUpdated"
         )
         for ((name, methodName) in pairs) {
             try {
@@ -71,5 +86,73 @@ object ShadeHook {
                 })
             } catch (_: Throwable) {}
         }
+
+        // Hook OPlus group notification row icon views (the small icons shown in a collapsed group)
+        try {
+            val rowIconViewClass = XposedHelpers.findClass(
+                "com.oplus.systemui.notification.row.oplusgroup.OplusGroupNotificationRowIconView",
+                lpparam.classLoader
+            )
+            XposedBridge.hookAllMethods(rowIconViewClass, "setIconDrawable", object : XC_MethodHook() {
+                private val inHook = ThreadLocal<Boolean>()
+
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    if (inHook.get() == true) return
+                    if (!PreferenceUtils.isShadeEnabled()) return
+                    try {
+                        val view = param.thisObject as? ImageView ?: return
+
+                        // Resolve notification entry: try direct field, then view hierarchy
+                        var entry: Any? = null
+                        for (fname in listOf("mEntry", "entry", "mNotificationEntry")) {
+                            try {
+                                entry = XposedHelpers.getObjectField(view, fname)
+                                if (entry != null) break
+                            } catch (_: Throwable) {}
+                        }
+                        if (entry == null) {
+                            var p: android.view.ViewParent? = view.parent ?: return
+                            var depth = 0
+                            while (p != null && depth < 12) {
+                                if (expandableRowClass.isInstance(p)) {
+                                    entry = getEntryMethod.invoke(p)
+                                    break
+                                }
+                                p = (p as? android.view.View)?.parent
+                                depth++
+                            }
+                        }
+                        val e = entry ?: return
+                        val getSbn = getSbnMethodCache.getOrPut(e.javaClass) {
+                            e.javaClass.getDeclaredMethod("getSbn")
+                        }
+                        val sbn = getSbn.invoke(e) ?: return
+                        val pkg = XposedHelpers.callMethod(sbn, "getPackageName") as? String ?: return
+                        val notification = XposedHelpers.callMethod(sbn, "getNotification") as? Notification
+                        val channelId = try { notification?.channelId } catch (_: Throwable) { null } ?: ""
+                        val ctx = view.context
+
+                        if (ChannelIconStore.isMonochrome(pkg, channelId)) return
+
+                        val replacement: android.graphics.drawable.Drawable? =
+                            if (channelId.isNotEmpty() && ChannelIconStore.getShadePath(pkg, channelId) != null) {
+                                IconUtils.channelOverrideIcon(pkg, channelId, ctx, "shade")?.loadDrawable(ctx)
+                                    ?: getCachedAppIcon(pkg, ctx)
+                            } else {
+                                getCachedAppIcon(pkg, ctx)
+                            }
+
+                        // Replace first Drawable argument with correct icon
+                        for (i in param.args.indices) {
+                            if (param.args[i] is android.graphics.drawable.Drawable) {
+                                inHook.set(true)
+                                try { param.args[i] = replacement } finally { inHook.remove() }
+                                return
+                            }
+                        }
+                    } catch (_: Throwable) {}
+                }
+            })
+        } catch (_: Throwable) {}
     }
 }

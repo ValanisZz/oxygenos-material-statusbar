@@ -17,4 +17,20 @@
     <string name="pref_coming_soon">Will be implemented in the next release</string>
     <string name="btn_restart_systemui">Apply changes and restart SystemUI</string>
     <string name="msg_saved">Applies all pending changes that require a restart of the system interface. SystemUI will be restarted — the screen may briefly go black or the interface may temporarily disappear, then return to normal.</string>
+    <string name="channel_icon_enabled">Custom icon</string>
+    <string name="channel_icon_file">Main icon</string>
+    <string name="channel_icon_file_shade">Notification shade icon</string>
+    <string name="channel_icon_file_aod">AOD icon</string>
+    <string name="channel_icon_section_title">Icon</string>
+    <string name="channel_icon_entry_title">Icon</string>
+    <string name="channel_icon_path_hint">Tap to select a Vector Drawable XML or SVG file</string>
+    <string name="channel_icon_path_placeholder">/storage/emulated/0/Download/my_icon.xml</string>
+    <string name="channel_icon_save">Save</string>
+    <string name="channel_icon_saved">Saved. Restart SystemUI from Material icons settings to apply.</string>
+    <string name="channel_icon_save_failed">Could not save. Grant root or check storage access.</string>
+    <string name="channel_icon_invalid_path">File not readable</string>
+    <string name="channel_icon_reset">Reset</string>
+    <string name="channel_icon_reset_done">Icon reset. Restart SystemUI to apply.</string>
+    <string name="pref_shade_group_mono">Monochrome in shade</string>
+    <string name="pref_shade_group_mono_desc">Use monochrome icons for grouped notifications in the notification shade</string>
 </resources>

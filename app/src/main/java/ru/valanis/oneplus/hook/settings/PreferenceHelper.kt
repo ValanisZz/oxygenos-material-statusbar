@@ -46,6 +46,18 @@ object PreferenceHelper {
         return try { XposedHelpers.callMethod(group, "getPreference", 0) } catch (_: Throwable) { null }
     }
 
+    /** Walks the preference tree and returns the direct parent [PreferenceGroup] of [target], or null. */
+    fun findParentOf(root: Any, target: Any): Any? {
+        val prefCount = try { XposedHelpers.callMethod(root, "getPreferenceCount") as? Int } catch (_: Throwable) { null } ?: return null
+        for (i in 0 until prefCount) {
+            val child = try { XposedHelpers.callMethod(root, "getPreference", i) } catch (_: Throwable) { null } ?: continue
+            if (child === target) return root
+            val nested = findParentOf(child, target)
+            if (nested != null) return nested
+        }
+        return null
+    }
+
     fun maxChildOrder(group: Any): Int? {
         val prefCount = try { XposedHelpers.callMethod(group, "getPreferenceCount") as? Int } catch (_: Throwable) { null } ?: return null
         if (prefCount <= 0) return null

@@ -8,11 +8,11 @@ import android.graphics.Rect
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.Icon
 import android.service.notification.StatusBarNotification
-import android.view.ViewGroup
 import android.widget.ImageView
 import androidx.core.graphics.drawable.toDrawable
 import dalvik.system.BaseDexClassLoader
 import dalvik.system.DexClassLoader
+import android.util.Log
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
@@ -30,6 +30,8 @@ object AodHook {
 
     private const val TAG = "OxygenOSMaterialIcons"
     private val engineHooked = AtomicBoolean(false)
+    // Set of "pkg/channelId" strings we've already logged a patch failure for (avoid flooding)
+    private val loggedPatchFailures = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
 
     private val isAodProcess: Boolean by lazy {
         val name = detectProcessName()
@@ -79,6 +81,90 @@ object AodHook {
         return saved ?: notification.smallIcon
     }
 
+    /**
+     * Patches notification.mSmallIcon at the earliest Zygote-level opportunity so that
+     * ALL renderers (shade first-draw, AOD, lock-screen) immediately see the channel icon.
+     * No-op if already patched or no channel override configured.
+     */
+    private fun tryEarlyPatch(pkg: String, notification: Notification) {
+        if (notification.extras?.containsKey(IconUtils.EXTRAS_ORIGINAL_ICON) == true) {
+            // Only skip if the patch actually worked (smallIcon is a bitmap = type 1).
+            // If smallIcon is still a resource (type 2), setObjectField failed last time —
+            // retry the patch exactly once (EXTRAS may be stale from a previous SystemUI session).
+            val currentType = notification.smallIcon?.type ?: -1
+            if (currentType == 1) return  // bitmap — patch is in effect
+            if (loggedPatchFailures.putIfAbsent("$pkg/retryPatch", true) != null) {
+                // Already retried — don't keep removing EXTRAS; iconCache should hold our bitmap.
+                return
+            }
+            Log.e(TAG, "tryEarlyPatch[$pkg]: EXTRAS set but smallIcon.type=$currentType — retrying patch once")
+            try { notification.extras?.remove(IconUtils.EXTRAS_ORIGINAL_ICON) } catch (_: Throwable) {}
+        }
+        val channelId = try { notification.channelId } catch (_: Throwable) { null }
+        if (channelId.isNullOrEmpty()) {
+            if (loggedPatchFailures.putIfAbsent("$pkg/noChannel", true) == null) {
+                Log.e(TAG, "tryEarlyPatch[$pkg]: skipped — channelId=null/empty")
+            }
+            return
+        }
+        val path = ru.valanis.oneplus.hook.core.ChannelIconStore.getAodPath(pkg, channelId)
+        if (path == null) {
+            val storeSize = ru.valanis.oneplus.hook.core.ChannelIconStore.cachedSize()
+            val failKey = "$pkg/$channelId"
+            if (loggedPatchFailures.putIfAbsent(failKey, true) == null) {
+                Log.e(TAG, "tryEarlyPatch[$pkg/$channelId]: path=null storeSize=$storeSize mainPath=${ru.valanis.oneplus.hook.core.ChannelIconStore.getPath(pkg, channelId)}")
+            }
+            return
+        }
+        run {
+            val failKey = "$pkg/$channelId/found"
+            if (loggedPatchFailures.putIfAbsent(failKey, true) == null) {
+                Log.e(TAG, "tryEarlyPatch[$pkg/$channelId]: path=$path")
+            }
+        }
+        val context = try {
+            val at = Class.forName("android.app.ActivityThread")
+            at.getMethod("currentApplication").invoke(null) as? android.content.Context
+        } catch (_: Throwable) { null }
+        if (context == null) {
+            Log.e(TAG, "tryEarlyPatch[$pkg/$channelId]: no context")
+            return
+        }
+        if (!ru.valanis.oneplus.hook.core.PreferenceUtils.isNotificationCategoryIconsEnabled()) return
+        val override = IconUtils.channelOverrideIcon(pkg, channelId, context, "aod")
+        if (override == null) {
+            Log.e(TAG, "tryEarlyPatch[$pkg/$channelId]: channelOverrideIcon=null path=$path")
+            return
+        }
+        try { notification.extras?.putParcelable(IconUtils.EXTRAS_ORIGINAL_ICON, notification.smallIcon) } catch (_: Throwable) {}
+        try { XposedHelpers.setObjectField(notification, "mSmallIcon", override) } catch (_: Throwable) {}
+        IconUtils.clearPackageBitmapCaches(pkg)
+        IconUtils.iconCache[pkg] = override
+        Log.e(TAG, "tryEarlyPatch[$pkg/$channelId]: PATCHED path=$path")
+    }
+
+    private fun resolveIconForAod(pkg: String, notification: Notification): Icon? {
+        if (notification.extras?.containsKey(IconUtils.EXTRAS_ORIGINAL_ICON) == true) {
+            return notification.smallIcon
+        }
+        val channelId = try { notification.channelId } catch (_: Throwable) { null }
+        if (!channelId.isNullOrEmpty()) {
+            val ctx = try {
+                Class.forName("android.app.ActivityThread")
+                    .getMethod("currentApplication").invoke(null) as? android.content.Context
+            } catch (_: Throwable) { null }
+            if (ctx != null) {
+                val override = IconUtils.channelOverrideIcon(pkg, channelId, ctx, "aod")
+                if (override != null) {
+                    IconUtils.clearPackageBitmapCaches(pkg)
+                    IconUtils.iconCache[pkg] = override
+                    return override
+                }
+            }
+        }
+        return IconUtils.customSmallIcon(pkg, notification) ?: originalSmallIcon(notification)
+    }
+
     fun hookZygoteSbnMethods() {
         val sbnClass = StatusBarNotification::class.java
 
@@ -87,9 +173,29 @@ object AodHook {
                 if (!PreferenceUtils.isModuleEnabled()) return
                 try {
                     val pkg = XposedHelpers.getObjectField(param.thisObject, "pkg") as? String ?: return
-                    if (pkg != "com.android.systemui" && IconUtils.iconCache.containsKey(pkg)) return
                     val notification = param.result as? Notification ?: return
-                    val icon = IconUtils.customSmallIcon(pkg, notification) ?: originalSmallIcon(notification) ?: return
+                    tryEarlyPatch(pkg, notification)
+                    if (notification.extras?.containsKey(IconUtils.EXTRAS_ORIGINAL_ICON) == true) {
+                        val patchedIcon = notification.smallIcon
+                        // Only cache if it's a bitmap (type 1 = our SVG). If type 2 (resource),
+                        // setObjectField likely failed — don't overwrite a potentially good cache.
+                        if (patchedIcon != null && patchedIcon.type == 1) {
+                            IconUtils.clearPackageBitmapCaches(pkg)
+                            IconUtils.iconCache[pkg] = patchedIcon
+                        }
+                        return
+                    }
+                    // Skip re-resolution only when there is definitely no channel override
+                    // configured for this notification.  If a channel override exists (even if
+                    // it failed to load before), always re-resolve so a freshly copied icon
+                    // file is picked up without needing to restart the AOD process.
+                    if (pkg != "com.android.systemui" && IconUtils.iconCache.containsKey(pkg)) {
+                        val channelId = try { notification.channelId } catch (_: Throwable) { null }
+                        val hasOverride = !channelId.isNullOrEmpty() &&
+                            ru.valanis.oneplus.hook.core.ChannelIconStore.getAodPath(pkg, channelId) != null
+                        if (!hasOverride) return
+                    }
+                    val icon = resolveIconForAod(pkg, notification) ?: return
                     IconUtils.iconCache[pkg] = icon
                 } catch (_: Throwable) {}
             }
@@ -99,10 +205,24 @@ object AodHook {
             override fun afterHookedMethod(param: MethodHookParam) {
                 if (!PreferenceUtils.isModuleEnabled()) return
                 val pkg = param.result as? String ?: return
-                if (pkg != "com.android.systemui" && IconUtils.iconCache.containsKey(pkg)) return
                 try {
                     val notification = XposedHelpers.getObjectField(param.thisObject, "notification") as? Notification ?: return
-                    val icon = IconUtils.customSmallIcon(pkg, notification) ?: originalSmallIcon(notification) ?: return
+                    tryEarlyPatch(pkg, notification)
+                    if (notification.extras?.containsKey(IconUtils.EXTRAS_ORIGINAL_ICON) == true) {
+                        val patchedIcon = notification.smallIcon
+                        if (patchedIcon != null && patchedIcon.type == 1) {
+                            IconUtils.clearPackageBitmapCaches(pkg)
+                            IconUtils.iconCache[pkg] = patchedIcon
+                        }
+                        return
+                    }
+                    if (pkg != "com.android.systemui" && IconUtils.iconCache.containsKey(pkg)) {
+                        val channelId = try { notification.channelId } catch (_: Throwable) { null }
+                        val hasOverride = !channelId.isNullOrEmpty() &&
+                            ru.valanis.oneplus.hook.core.ChannelIconStore.getAodPath(pkg, channelId) != null
+                        if (!hasOverride) return
+                    }
+                    val icon = resolveIconForAod(pkg, notification) ?: return
                     IconUtils.iconCache[pkg] = icon
                 } catch (_: Throwable) {}
             }
@@ -173,6 +293,7 @@ object AodHook {
     fun hookSystemUIAod(lpparam: XC_LoadPackage.LoadPackageParam) {
         hookAodCurvedDisplaySmallIcon(lpparam)
         hookAodNotificationLayoutSmallIcon(lpparam)
+        hookAodNotificationListenerGetActiveNotifications(lpparam)
     }
 
     fun hookEngineLoaderInProcess() {
@@ -196,6 +317,7 @@ object AodHook {
     // ═══════════════════════════════════════════════
 
     fun hookAodProcess(lpparam: XC_LoadPackage.LoadPackageParam) {
+        Log.e(TAG, "hookAodProcess: pid=${android.os.Process.myPid()} pkg=${lpparam.packageName}")
         try {
             val cfgClass = XposedHelpers.findClass(
                 "com.oplus.content.OplusFeatureConfigManager", lpparam.classLoader
@@ -209,7 +331,9 @@ object AodHook {
                     }
                 }
             })
-        } catch (_: Throwable) {}
+        } catch (t: Throwable) {
+            Log.e(TAG, "hookAodProcess: OplusFeatureConfigManager hook failed: ${t.message}")
+        }
         hookUIEngineManagerInit(lpparam)
     }
 
@@ -223,70 +347,97 @@ object AodHook {
                 "com.oplus.systemui.aod.aodclock.off.notification.NotificationLayout",
                 lpparam.classLoader
             )
-            val sbnClass = XposedHelpers.findClass(
-                "android.service.notification.StatusBarNotification",
-                lpparam.classLoader
-            )
-            XposedHelpers.findAndHookMethod(
-                layoutClass, "updateNotificationView", sbnClass,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        if (!PreferenceUtils.isAodEnabled()) return
-                        try {
-                            val sbn = param.args.getOrNull(0) ?: return
-                            val pkg = XposedHelpers.callMethod(sbn, "getPackageName") as? String ?: return
-                            val notification = XposedHelpers.callMethod(sbn, "getNotification") as? Notification ?: return
-                            val smallIcon = IconUtils.customSmallIcon(pkg, notification) ?: originalSmallIcon(notification) ?: return
-                            val layout = param.thisObject as ViewGroup
-                            val count = layout.childCount
-                            if (count == 0) return
-                            val lastChild = layout.getChildAt(count - 1) as? ImageView ?: return
-                            val context = layout.context
-                            val pkgContext = try { context.createPackageContext(pkg, 0) } catch (_: Throwable) { context }
-                            val iconDrawable = smallIcon.loadDrawable(pkgContext) ?: return
-                            val mono = IconUtils.getCachedMonochrome(smallIcon, pkg, iconDrawable)
-                            lastChild.setImageDrawable(mono)
-                        } catch (_: Throwable) {}
-                    }
+            // onReceiveNotification(SBN[] allActive, SBN incoming, boolean flag)
+            XposedBridge.hookAllMethods(layoutClass, "onReceiveNotification", object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    if (!PreferenceUtils.isAodEnabled()) return
+                    try {
+                        // Patch the incoming SBN (arg1) before the layout renders it
+                        val sbn = param.args.getOrNull(1) ?: return
+                        val pkg = XposedHelpers.callMethod(sbn, "getPackageName") as? String ?: return
+                        val notification = XposedHelpers.callMethod(sbn, "getNotification") as? Notification ?: return
+                        tryEarlyPatch(pkg, notification)
+                    } catch (_: Throwable) {}
                 }
-            )
-        } catch (_: Throwable) {}
+            })
+            Log.e(TAG, "hookAodNotificationLayoutSmallIcon: hooked NotificationLayout.onReceiveNotification")
+        } catch (t: Throwable) {
+            Log.e(TAG, "hookAodNotificationLayoutSmallIcon FAILED: ${t.message}")
+        }
     }
 
     private fun hookAodCurvedDisplaySmallIcon(lpparam: XC_LoadPackage.LoadPackageParam) {
+        // CurvedDisplayManager posts ShowCurvedNotification (a Runnable) to a Handler.
+        // When run() fires, mNotification holds the SBN to display on the curved edge.
         try {
-            val viewClass = XposedHelpers.findClass(
-                "com.oplus.systemui.aod.surface.OplusAodCurvedDisplayView",
+            val runnableClass = XposedHelpers.findClass(
+                "com.oplus.systemui.aod.common.CurvedDisplayManager\$ShowCurvedNotification",
                 lpparam.classLoader
             )
-            val sbnClass = XposedHelpers.findClass(
-                "android.service.notification.StatusBarNotification",
+            XposedBridge.hookAllMethods(runnableClass, "run", object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    if (!PreferenceUtils.isAodEnabled()) return
+                    try {
+                        val sbn = XposedHelpers.getObjectField(param.thisObject, "mNotification")
+                            as? StatusBarNotification ?: return
+                        val pkg = sbn.packageName
+                        val notification = sbn.notification
+                        tryEarlyPatch(pkg, notification)
+                        // Also patch mIncomingNotiPaint.mDrawable on the curved view
+                        val mgr = XposedHelpers.getObjectField(param.thisObject, "instance") ?: return
+                        val view = XposedHelpers.getObjectField(mgr, "mCurvedDisplayView") ?: return
+                        val paint = XposedHelpers.getObjectField(view, "mIncomingNotiPaint") ?: return
+                        val channelId = try { notification.channelId } catch (_: Throwable) { null }
+                        if (channelId.isNullOrEmpty()) return
+                        val ctx = try {
+                            Class.forName("android.app.ActivityThread")
+                                .getMethod("currentApplication").invoke(null) as? android.content.Context
+                        } catch (_: Throwable) { null } ?: return
+                        val override = IconUtils.channelOverrideIcon(pkg, channelId, ctx, "aod") ?: return
+                        val pkgContext = try { ctx.createPackageContext(pkg, 0) } catch (_: Throwable) { ctx }
+                        val iconDrawable = override.loadDrawable(pkgContext) ?: return
+                        val monoDrawable = IconUtils.getCachedMonochrome(override, pkg, iconDrawable)
+                        val iconRect = try { XposedHelpers.getObjectField(paint, "mIconRect") as? Rect } catch (_: Throwable) { null }
+                        if (iconRect != null) monoDrawable.bounds = iconRect
+                        XposedHelpers.setObjectField(paint, "mDrawable", monoDrawable)
+                    } catch (_: Throwable) {}
+                }
+            })
+            Log.e(TAG, "hookAodCurvedDisplaySmallIcon: hooked ShowCurvedNotification.run")
+        } catch (t: Throwable) {
+            Log.e(TAG, "hookAodCurvedDisplaySmallIcon FAILED: ${t.message}")
+        }
+    }
+
+    /**
+     * Patches SBNs returned by AodNotificationListenerService.getActiveNotifications() so that
+     * notifications already showing on AOD (before this hook was installed) get the correct icon
+     * the next time the layout refreshes its view.
+     */
+    private fun hookAodNotificationListenerGetActiveNotifications(lpparam: XC_LoadPackage.LoadPackageParam) {
+        try {
+            val serviceClass = XposedHelpers.findClass(
+                "com.oplus.systemui.aod.common.AodNotificationListenerService",
                 lpparam.classLoader
             )
-            XposedHelpers.findAndHookMethod(
-                viewClass, "updateReceiveNotification", sbnClass,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        if (!PreferenceUtils.isAodEnabled()) return
+            XposedBridge.hookAllMethods(serviceClass, "getActiveNotifications", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    if (!PreferenceUtils.isAodEnabled()) return
+                    val sbnArray = param.result as? Array<*> ?: return
+                    for (sbn in sbnArray) {
+                        sbn ?: continue
                         try {
-                            val sbn = param.args.getOrNull(0) as? StatusBarNotification ?: return
-                            val pkg = XposedHelpers.callMethod(sbn, "getPackageName") as? String ?: return
-                            val notification = XposedHelpers.callMethod(sbn, "getNotification") as? Notification ?: return
-                            val smallIcon = IconUtils.customSmallIcon(pkg, notification) ?: originalSmallIcon(notification) ?: return
-                            val view = param.thisObject
-                            val paint = XposedHelpers.getObjectField(view, "mIncomingNotiPaint") ?: return
-                            val context = XposedHelpers.getObjectField(paint, "mContext") as? Context ?: return
-                            val pkgContext = try { context.createPackageContext(pkg, 0) } catch (_: Throwable) { context }
-                            val iconDrawable = smallIcon.loadDrawable(pkgContext) ?: return
-                            val monoDrawable = IconUtils.getCachedMonochrome(smallIcon, pkg, iconDrawable)
-                            val iconRect = XposedHelpers.getObjectField(paint, "mIconRect") as? Rect ?: return
-                            monoDrawable.bounds = iconRect
-                            XposedHelpers.setObjectField(paint, "mDrawable", monoDrawable)
+                            val pkg = XposedHelpers.callMethod(sbn, "getPackageName") as? String ?: continue
+                            val notification = XposedHelpers.callMethod(sbn, "getNotification") as? Notification ?: continue
+                            tryEarlyPatch(pkg, notification)
                         } catch (_: Throwable) {}
                     }
                 }
-            )
-        } catch (_: Throwable) {}
+            })
+            Log.e(TAG, "hookAodNotificationListenerGetActiveNotifications: hooked getActiveNotifications")
+        } catch (t: Throwable) {
+            Log.e(TAG, "hookAodNotificationListenerGetActiveNotifications FAILED: ${t.message}")
+        }
     }
 
     private fun hookUIEngineManagerInit(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -299,14 +450,27 @@ object AodHook {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         try {
-                            val engineCL = XposedHelpers.getObjectField(param.thisObject, "engineClassLoader") as? ClassLoader ?: return
-                            if (!engineHooked.compareAndSet(false, true)) return
+                            val engineCL = XposedHelpers.getObjectField(param.thisObject, "engineClassLoader") as? ClassLoader
+                            if (engineCL == null) {
+                                Log.e(TAG, "UIEngineManager.init: engineClassLoader field not found")
+                                return
+                            }
+                            if (!engineHooked.compareAndSet(false, true)) {
+                                Log.e(TAG, "UIEngineManager.init: engine already hooked, skip")
+                                return
+                            }
+                            Log.e(TAG, "UIEngineManager.init: hooking engine classes via $engineCL")
                             hookAllEngineClasses(engineCL)
-                        } catch (_: Throwable) {}
+                        } catch (t: Throwable) {
+                            Log.e(TAG, "UIEngineManager.init error: ${t.message}")
+                        }
                     }
                 }
             )
-        } catch (_: Throwable) {}
+            Log.e(TAG, "hookUIEngineManagerInit: hooked UIEngineManager.init")
+        } catch (t: Throwable) {
+            Log.e(TAG, "hookUIEngineManagerInit FAILED: ${t.message}")
+        }
     }
 
     // ═══════════════════════════════════════════════
@@ -314,10 +478,20 @@ object AodHook {
     // ═══════════════════════════════════════════════
 
     private fun hookAllEngineClasses(engineCL: ClassLoader) {
-        try { hookEngineUpdateNotificationIconData(engineCL) } catch (_: Throwable) {}
-        try { hookEngineNotificationView(engineCL) } catch (_: Throwable) {}
-        try { hookEngineEgCommonHelper(engineCL) } catch (_: Throwable) {}
-        try { hookEngineGlideLoader(engineCL) } catch (_: Throwable) {}
+        var ok = 0
+        try { hookEngineUpdateNotificationIconData(engineCL); ok++ } catch (t: Throwable) {
+            Log.e(TAG, "engine hookUpdateNotificationIconData FAILED: ${t.message}")
+        }
+        try { hookEngineNotificationView(engineCL); ok++ } catch (t: Throwable) {
+            Log.e(TAG, "engine hookNotificationView FAILED: ${t.message}")
+        }
+        try { hookEngineEgCommonHelper(engineCL); ok++ } catch (t: Throwable) {
+            Log.e(TAG, "engine hookEgCommonHelper FAILED: ${t.message}")
+        }
+        try { hookEngineGlideLoader(engineCL); ok++ } catch (t: Throwable) {
+            Log.e(TAG, "engine hookGlideLoader FAILED: ${t.message}")
+        }
+        Log.e(TAG, "hookAllEngineClasses: $ok/4 hooks installed")
     }
 
     private fun hookEngineUpdateNotificationIconData(engineCL: ClassLoader) {
@@ -332,6 +506,8 @@ object AodHook {
                     val drawableArray = drawables as Array<*>
                     val context = XposedHelpers.getObjectField(param.thisObject, "mContext") as? Context ?: return
 
+                    Log.e(TAG, "updateNotificationIconData: pkgs=${pkgArray.toList()}")
+
                     for (i in pkgArray.indices) {
                         val pkg = pkgArray[i] as? String ?: continue
                         if (pkg.isEmpty()) continue
@@ -341,6 +517,7 @@ object AodHook {
                         val targetH = originalDrawable?.intrinsicHeight ?: 0
 
                         val cachedIcon = IconUtils.iconCache[pkg]
+                        Log.e(TAG, "updateNotificationIconData[$pkg]: cachedIcon=${cachedIcon?.type}")
                         if (cachedIcon != null) {
                             try {
                                 val rawDrawable = IconUtils.loadIconWithoutTheme(cachedIcon, pkg, context)
@@ -393,7 +570,7 @@ object AodHook {
                     if (showList.size >= 6) return
 
                     val notification = XposedHelpers.callMethod(sbn, "getNotification") as? Notification ?: return
-                    val smallIcon = IconUtils.customSmallIcon(pkg, notification) ?: originalSmallIcon(notification) ?: return
+                    val smallIcon = resolveIconForAod(pkg, notification) ?: return
                     val context = XposedHelpers.getObjectField(param.thisObject, "mContext") as? Context ?: return
                     val drawable = smallIcon.loadDrawable(context) ?: return
                     val monoDrawable = IconUtils.getCachedMonochrome(smallIcon, pkg, drawable)

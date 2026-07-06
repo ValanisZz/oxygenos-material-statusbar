@@ -10,6 +10,7 @@ import android.view.View
 import android.view.ViewGroup
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
+import ru.valanis.oneplus.hook.core.IconUtils
 import ru.valanis.oneplus.hook.core.PreferenceUtils
 import ru.valanis.oneplus.statusbar.material.R
 import ru.valanis.oneplus.statusbar.material.settings.ModulePreferences
@@ -50,13 +51,21 @@ object SettingsScreenBuilder {
         val enableShade = prefBool(ModulePreferences.KEY_ENABLE_SHADE, ModulePreferences.DEFAULT_ENABLE_SHADE)
         val enableAod = prefBool(ModulePreferences.KEY_ENABLE_AOD, ModulePreferences.DEFAULT_ENABLE_AOD)
 
+        val enableCategoryIcons = prefBool(
+            ModulePreferences.KEY_ENABLE_NOTIFICATION_CATEGORY_ICONS,
+            ModulePreferences.DEFAULT_ENABLE_NOTIFICATION_CATEGORY_ICONS
+        )
+        val enableCustomIcons = prefBool(
+            ModulePreferences.KEY_ENABLE_CUSTOM_ICONS,
+            ModulePreferences.DEFAULT_ENABLE_CUSTOM_ICONS
+        )
         val currentPrefs = mutableMapOf(
             ModulePreferences.KEY_ENABLE_MODULE to enableModule,
             ModulePreferences.KEY_ENABLE_STATUS_BAR to enableStatusBar,
             ModulePreferences.KEY_ENABLE_SHADE to enableShade,
             ModulePreferences.KEY_ENABLE_AOD to enableAod,
-            ModulePreferences.KEY_ENABLE_NOTIFICATION_CATEGORY_ICONS to false,
-            ModulePreferences.KEY_ENABLE_CUSTOM_ICONS to false
+            ModulePreferences.KEY_ENABLE_NOTIFICATION_CATEGORY_ICONS to enableCategoryIcons,
+            ModulePreferences.KEY_ENABLE_CUSTOM_ICONS to enableCustomIcons
         )
 
         val prefClass = XposedHelpers.findClass("androidx.preference.Preference", classLoader)
@@ -174,11 +183,15 @@ object SettingsScreenBuilder {
         val swStatus = addSwitch(behaviorCategory, ModulePreferences.KEY_ENABLE_STATUS_BAR, R.string.pref_status_bar, R.string.pref_status_bar_desc, enableStatusBar, enableModule)
         val swShade = addSwitch(behaviorCategory, ModulePreferences.KEY_ENABLE_SHADE, R.string.pref_shade, R.string.pref_shade_desc, enableShade, enableModule)
         val swAod = addSwitch(behaviorCategory, ModulePreferences.KEY_ENABLE_AOD, R.string.pref_aod, R.string.pref_aod_desc, enableAod, enableModule)
-        val comingSoon = settingsCtx.getString(R.string.pref_coming_soon)
-        val swNotificationCategories = addSwitch(appsCategory, ModulePreferences.KEY_ENABLE_NOTIFICATION_CATEGORY_ICONS, R.string.pref_notification_categories, R.string.pref_notification_categories_desc, false, false)
-        try { XposedHelpers.callMethod(swNotificationCategories, "setSummary", settingsCtx.getString(R.string.pref_notification_categories_desc) + "\n\n" + comingSoon) } catch (_: Throwable) {}
-        val swCustom = addSwitch(appsCategory, ModulePreferences.KEY_ENABLE_CUSTOM_ICONS, R.string.pref_custom_icons, R.string.pref_custom_icons_desc, false, false)
-        try { XposedHelpers.callMethod(swCustom, "setSummary", settingsCtx.getString(R.string.pref_custom_icons_desc) + "\n\n" + comingSoon) } catch (_: Throwable) {}
+        val swNotificationCategories = addSwitch(
+            appsCategory,
+            ModulePreferences.KEY_ENABLE_NOTIFICATION_CATEGORY_ICONS,
+            R.string.pref_notification_categories,
+            R.string.pref_notification_categories_desc,
+            enableCategoryIcons,
+            enableModule
+        )
+        val swCustom = addSwitch(appsCategory, ModulePreferences.KEY_ENABLE_CUSTOM_ICONS, R.string.pref_custom_icons, R.string.pref_custom_icons_desc, enableCustomIcons, false)
 
         applyUnifiedSectionStyle(listOf(swModule))
         applyUnifiedSectionStyle(listOf(swStatus, swShade, swAod))
@@ -212,6 +225,7 @@ object SettingsScreenBuilder {
                     try { XposedHelpers.callMethod(swStatus, "setEnabled", newValue) } catch (_: Throwable) {}
                     try { XposedHelpers.callMethod(swShade, "setEnabled", newValue) } catch (_: Throwable) {}
                     try { XposedHelpers.callMethod(swAod, "setEnabled", newValue) } catch (_: Throwable) {}
+                    try { XposedHelpers.callMethod(swNotificationCategories, "setEnabled", newValue) } catch (_: Throwable) {}
                 }
                 return@newProxyInstance true
             }
@@ -230,6 +244,7 @@ object SettingsScreenBuilder {
         try { XposedHelpers.callMethod(swStatus, "setOnPreferenceChangeListener", changeListener) } catch (_: Throwable) {}
         try { XposedHelpers.callMethod(swShade, "setOnPreferenceChangeListener", changeListener) } catch (_: Throwable) {}
         try { XposedHelpers.callMethod(swAod, "setOnPreferenceChangeListener", changeListener) } catch (_: Throwable) {}
+        try { XposedHelpers.callMethod(swNotificationCategories, "setOnPreferenceChangeListener", changeListener) } catch (_: Throwable) {}
 
         try { XposedHelpers.callMethod(restartPref, "setOnPreferenceClickListener", restartListener) } catch (_: Throwable) {}
 
@@ -441,6 +456,7 @@ object SettingsScreenBuilder {
     // ── Restart SystemUI ───────────────────────────────────────────────
 
     private fun clearCachesAndRestartSystemUi(context: Context) {
+        try { IconUtils.clearAllCaches() } catch (_: Throwable) {}
         if (tryRestartViaSu()) return
         if (tryRestartViaActivityManager(context)) return
         tryRestartViaAmCommand()

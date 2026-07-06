@@ -1,6 +1,8 @@
 package ru.valanis.oneplus.hook
 
 import android.annotation.SuppressLint
+import android.os.Process
+import android.util.Log
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
 import de.robv.android.xposed.XposedBridge
@@ -66,7 +68,17 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                     XposedBridge.log("$TAG SystemUI: ${t.message}")
                 }
             }
-            "com.android.settings" -> SettingsHook.hook(lpparam)
+            "com.android.settings",
+            "com.oplus.notificationmanager",
+                -> {
+                    if (lpparam.packageName == "com.oplus.notificationmanager") {
+                        Log.e(
+                            TAG,
+                            "handleLoadPackage notificationmanager pid=${Process.myPid()}"
+                        )
+                    }
+                    SettingsHook.hook(lpparam)
+                }
             "com.oplus.aod" -> AodHook.hookAodProcess(lpparam)
         }
     }

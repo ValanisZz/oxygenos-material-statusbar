@@ -50,10 +50,13 @@ object StatusBarHook {
                         val notification = XposedHelpers.callMethod(sbn, "getNotification") as Notification
                         val iconField = XposedHelpers.findField(statusBarIconClass, "icon")
 
+                        // Replace notification.smallIcon once so all system renderers use our icon
+                        patchNotificationSmallIcon(pkgName, notification, context)
+
                         if (!allowConversationGroup) {
                             handleStatusBarIcon(result, iconField, pkgName, notification, context)
                         } else {
-                            handleShadeIcon(result, iconField, pkgName, context)
+                            handleShadeIcon(result, iconField, pkgName, notification, context)
                         }
                     } catch (t: Throwable) {
                         XposedBridge.log("$TAG SystemUI: ${t.message}")
@@ -61,6 +64,25 @@ object StatusBarHook {
                 }
             }
         )
+    }
+
+    /**
+     * Patches [Notification.mSmallIcon] with the channel override so that every system
+     * renderer (shade, heads-up, AOD, lock-screen) automatically picks it up.
+     * The original icon is saved to extras once so it can be restored later.
+     */
+    private fun patchNotificationSmallIcon(pkgName: String, notification: Notification, context: Context) {
+        val channelId = try { notification.channelId } catch (_: Throwable) { null } ?: ""
+        if (channelId.isEmpty()) return
+        // Already patched?
+        val extras = notification.extras ?: return
+        if (extras.containsKey(IconUtils.EXTRAS_ORIGINAL_ICON)) return
+        val override = IconUtils.channelOverrideIcon(pkgName, channelId, context) ?: return
+        // Save original before replacing
+        try { extras.putParcelable(IconUtils.EXTRAS_ORIGINAL_ICON, notification.smallIcon) } catch (_: Throwable) {}
+        try {
+            XposedHelpers.setObjectField(notification, "mSmallIcon", override)
+        } catch (_: Throwable) {}
     }
 
     @Suppress("DEPRECATION")
@@ -78,12 +100,25 @@ object StatusBarHook {
         notification: Notification,
         context: Context
     ) {
-        val smallIcon = IconUtils.customSmallIcon(pkgName, notification) ?: originalSmallIcon(notification) ?: return
-        val iconKey = IconUtils.getIconCacheKey(smallIcon, pkgName) ?: "bmp_$pkgName"
+        val channelId = try { notification.channelId } catch (_: Throwable) { null } ?: ""
+        val channelOverride = if (channelId.isNotEmpty())
+            IconUtils.channelOverrideIcon(pkgName, channelId, context) else null
+        val smallIcon = channelOverride
+            ?: IconUtils.customSmallIcon(pkgName, notification, context)
+            ?: originalSmallIcon(notification) ?: return
+        val iconKey = IconUtils.getIconCacheKey(smallIcon, pkgName) ?: "bmp_${pkgName}_$channelId"
         val cacheKey = "sb_$iconKey"
 
         IconUtils.descriptorCache[cacheKey]?.let { cached ->
             iconField.set(result, cached)
+            return
+        }
+
+        // Channel override icons are user-provided bitmaps — use as-is, no processing
+        if (channelOverride != null) {
+            IconUtils.evictIfNeeded(IconUtils.descriptorCache, IconUtils.MAX_DESCRIPTOR_CACHE)
+            IconUtils.descriptorCache[cacheKey] = channelOverride
+            iconField.set(result, channelOverride)
             return
         }
 
@@ -134,17 +169,24 @@ object StatusBarHook {
         result: Any,
         iconField: java.lang.reflect.Field,
         pkgName: String,
+        notification: Notification,
         context: Context
     ) {
-        val shadeCacheKey = "shade_$pkgName"
+        val channelId = try { notification.channelId } catch (_: Throwable) { null } ?: ""
+        val shadeCacheKey = if (channelId.isNotEmpty()) "shade_${pkgName}_$channelId" else "shade_$pkgName"
         IconUtils.descriptorCache[shadeCacheKey]?.let { cached ->
             iconField.set(result, cached)
             return
         }
-        val appIcon = ShadeHook.getCachedAppIcon(pkgName, context)
-        val appBitmapIcon = Icon.createWithBitmap(appIcon.toBitmap())
+        val override = IconUtils.channelOverrideIcon(pkgName, channelId, context)
+        val finalIcon = if (override != null) {
+            override
+        } else {
+            val appIcon = ShadeHook.getCachedAppIcon(pkgName, context)
+            Icon.createWithBitmap(appIcon.toBitmap())
+        }
         IconUtils.evictIfNeeded(IconUtils.descriptorCache, IconUtils.MAX_DESCRIPTOR_CACHE)
-        IconUtils.descriptorCache[shadeCacheKey] = appBitmapIcon
-        iconField.set(result, appBitmapIcon)
+        IconUtils.descriptorCache[shadeCacheKey] = finalIcon
+        iconField.set(result, finalIcon)
     }
 }

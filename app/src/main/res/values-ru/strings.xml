@@ -17,4 +17,20 @@
     <string name="pref_coming_soon">Будет реализовано в следующей версии</string>
     <string name="btn_restart_systemui">Применить изменения и перезапустить SystemUI</string>
     <string name="msg_saved">Применить все ранее сделанные изменения, требующие перезагрузки оболочки системы. SystemUI будет перезапущен — экран на мгновение погаснет или интерфейс временно пропадёт, затем восстановится в обычном режиме.</string>
+    <string name="channel_icon_enabled">Пользовательская иконка</string>
+    <string name="channel_icon_file">Основная иконка</string>
+    <string name="channel_icon_file_shade">Иконка в шторке уведомлений</string>
+    <string name="channel_icon_file_aod">Иконка для AOD</string>
+    <string name="channel_icon_section_title">Иконка</string>
+    <string name="channel_icon_entry_title">Иконка</string>
+    <string name="channel_icon_path_hint">Нажмите, чтобы выбрать файл Vector Drawable XML или SVG</string>
+    <string name="channel_icon_path_placeholder">/storage/emulated/0/Download/my_icon.xml</string>
+    <string name="channel_icon_save">Сохранить</string>
+    <string name="channel_icon_saved">Сохранено. Перезапустите SystemUI в настройках Material icons.</string>
+    <string name="channel_icon_save_failed">Не удалось сохранить. Нужен root или доступ к хранилищу.</string>
+    <string name="channel_icon_invalid_path">Файл недоступен для чтения</string>
+    <string name="channel_icon_reset">Сброс</string>
+    <string name="channel_icon_reset_done">Иконка сброшена. Перезапустите SystemUI для применения.</string>
+    <string name="pref_shade_group_mono">Монохромная в шторке</string>
+    <string name="pref_shade_group_mono_desc">Использовать монохромные иконки для сгруппированных уведомлений в шторке</string>
 </resources>
