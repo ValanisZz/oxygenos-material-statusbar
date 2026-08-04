@@ -5,6 +5,8 @@
 .DS_Store
 .externalNativeBuild
 .cxx
+.claude
+.vscode
 local.properties
 
 /apk
@@ -14,3 +16,5 @@ local.properties
 Settings.apk
 
 /oxygen_extracted
+/AGENTS.md
+/CLAUDE.md

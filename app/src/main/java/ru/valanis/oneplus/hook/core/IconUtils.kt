@@ -38,6 +38,15 @@ object IconUtils {
     private const val MAX_RAW_ICON_CACHE = 50
     const val MAX_DESCRIPTOR_CACHE = 100
 
+    private val SYSTEM_DIALER_PKGS = setOf(
+        "com.android.server.telecom",
+        "com.android.phone",
+        "com.android.dialer",
+        "com.google.android.dialer",
+        "com.oplus.dialer"
+    )
+
+    // Package -> author icon for all of its notifications
     private val CUSTOM_SMALL_ICONS = mapOf(
         "com.android.mms" to R.drawable.ic_notify_mms,
         "com.oplus.battery" to R.drawable.ic_notify_battery_full,
@@ -48,6 +57,10 @@ object IconUtils {
         "com.oplus.ota" to R.drawable.ic_notify_ota,
     )
 
+    /** Every package that can get an author icon, in settings-screen order. */
+    val CUSTOM_ICON_PKGS: List<String> =
+        CUSTOM_SMALL_ICONS.keys.toList() + "com.android.systemui" + SYSTEM_DIALER_PKGS
+
     val iconCache = ConcurrentHashMap<String, Icon>()
     val monochromeCache = ConcurrentHashMap<String, Drawable>()
     private val fitCache = ConcurrentHashMap<String, Drawable>()
@@ -55,6 +68,11 @@ object IconUtils {
     val descriptorCache = ConcurrentHashMap<String, Icon>()
 
     private val channelDrawableByPath = ConcurrentHashMap<String, Drawable>()
+    private val channelIconByKey = ConcurrentHashMap<String, Icon>()
+
+    // Paths that recently failed to load — don't retry for 30 s
+    private val loadFailureAtMs = ConcurrentHashMap<String, Long>()
+    private val preloading = java.util.concurrent.atomic.AtomicBoolean(false)
 
     private fun applicationContextOrNull(): Context? {
         return try {
@@ -72,6 +90,8 @@ object IconUtils {
         rawIconCache.clear()
         descriptorCache.clear()
         channelDrawableByPath.clear()
+        channelIconByKey.clear()
+        loadFailureAtMs.clear()
         ChannelIconStore.invalidateCache()
     }
 
@@ -88,26 +108,16 @@ object IconUtils {
 
     private const val ANDROID_NS = "http://schemas.android.com/apk/res/android"
 
-    /**
-     * Reads file content with su fallback (SystemUI can't read /sdcard directly due to SELinux).
-     */
-    private fun readFileBytes(path: String): ByteArray? {
-        try {
-            val file = File(path)
-            if (file.canRead()) return file.readBytes()
-            android.util.Log.e("OxygenOSMaterialIcons", "readFileBytes: canRead=false path=$path")
-        } catch (_: Throwable) {}
+    /** Reads an icon: a module provider URI ([ChannelIconStore]) or a plain readable file. */
+    private fun readFileBytes(path: String, context: Context): ByteArray? {
         return try {
-            val process = Runtime.getRuntime().exec(
-                arrayOf("su", "-c", "cat '$path' 2>/dev/null")
-            )
-            val bytes = process.inputStream.readBytes()
-            process.waitFor()
-            val result = bytes.takeIf { it.isNotEmpty() }
-            if (result == null) android.util.Log.e("OxygenOSMaterialIcons", "readFileBytes: su empty for $path")
-            result
+            if (path.startsWith("content://")) {
+                context.contentResolver.openInputStream(android.net.Uri.parse(path))?.use { it.readBytes() }
+            } else {
+                File(path).readBytes()
+            }
         } catch (t: Throwable) {
-            android.util.Log.e("OxygenOSMaterialIcons", "readFileBytes: su failed for $path: ${t.message}")
+            android.util.Log.e("OxygenOSMaterialIcons", "readFileBytes: $path: ${t.message}")
             null
         }
     }
@@ -123,26 +133,66 @@ object IconUtils {
             channelDrawableByPath[cacheKey]?.let { d ->
                 return d.constantState?.newDrawable()?.mutate() ?: d
             }
-            val bytes = readFileBytes(path) ?: return null
+            loadFailureAtMs[path]?.let { failedAt ->
+                if (System.currentTimeMillis() - failedAt < 30_000L) return null
+            }
+            val bytes = readFileBytes(path, context)
+            if (bytes == null) {
+                recordLoadFailure(path)
+                return null
+            }
             val drawable = when {
                 path.endsWith(".xml", ignoreCase = true) ->
                     parseVectorDrawableXml(String(bytes, Charsets.UTF_8), context)
                 path.endsWith(".svg", ignoreCase = true) ->
                     parseSvgXml(String(bytes, Charsets.UTF_8), context)
                 else -> {
-                    val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                        ?: return null
-                    BitmapDrawable(context.resources, bmp)
+                    android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        ?.let { BitmapDrawable(context.resources, it) }
                 }
             }
-            if (drawable == null) return null
+            if (drawable == null) {
+                recordLoadFailure(path)
+                return null
+            }
+            loadFailureAtMs.remove(path)
             val mutable = drawable.mutate()
             evictIfNeeded(channelDrawableByPath, 40)
             channelDrawableByPath[cacheKey] = mutable
             mutable.constantState?.newDrawable()?.mutate() ?: mutable
         } catch (_: Throwable) {
+            recordLoadFailure(path)
             null
         }
+    }
+
+    private fun recordLoadFailure(path: String) {
+        evictIfNeeded(loadFailureAtMs, 40)
+        loadFailureAtMs[path] = System.currentTimeMillis()
+    }
+
+    /**
+     * Warms the drawable cache off the UI thread so the first draw of a freshly posted
+     * notification is a cache hit instead of a synchronous file read + parse.
+     */
+    fun preloadChannelIcons(values: Collection<String>) {
+        val paths = values.filter { it.startsWith("/") }.distinct()
+        if (paths.isEmpty()) return
+        if (!preloading.compareAndSet(false, true)) return
+        Thread {
+            try {
+                val ctx = applicationContextOrNull() ?: return@Thread
+                for (p in paths) {
+                    try { loadDrawableFromXmlPath(p, ctx) } catch (_: Throwable) {}
+                }
+            } finally {
+                preloading.set(false)
+            }
+        }.apply {
+            name = "OxygenMaterialIconPreload"
+            isDaemon = true
+            priority = Thread.MIN_PRIORITY
+        }.start()
     }
 
     /**
@@ -202,106 +252,197 @@ object IconUtils {
         return BitmapDrawable(context.resources, bitmap)
     }
 
+    private class SvgStyle(
+        val fill: Int?,
+        val stroke: Int?,
+        val strokeWidth: Float,
+        val evenOdd: Boolean,
+        val cap: Paint.Cap,
+        val join: Paint.Join,
+        val matrix: android.graphics.Matrix
+    )
+
+    // Elements whose content is not drawn directly
+    private val SVG_NON_RENDERED = setOf(
+        "defs", "clippath", "mask", "symbol", "marker", "pattern", "lineargradient",
+        "radialgradient", "filter", "title", "desc", "metadata", "style"
+    )
+
     /**
-     * Minimal SVG parser supporting `<path d="...">` elements with fill/stroke attributes.
-     * SVG path data (`d`) uses the same syntax as Android VectorDrawable `pathData`,
-     * so we reuse PathParser. Groups (`<g>`) are traversed but transforms are ignored.
+     * Minimal SVG renderer: path / line / rect / circle / ellipse / polygon / polyline with
+     * fill, stroke, stroke-width, fill-rule, linecap and linejoin inherited from <svg> / <g>
+     * (attributes or style="..."), plus transforms. SVG path data (`d`) uses the same syntax as
+     * VectorDrawable `pathData`, so PathParser handles it.
      */
     private fun parseSvgXml(xmlContent: String, context: Context): Drawable? {
         val parser = XmlPullParserFactory.newInstance().apply { isNamespaceAware = true }.newPullParser()
         parser.setInput(StringReader(xmlContent))
 
-        var viewportW = 24f
-        var viewportH = 24f
-        val paths = mutableListOf<Triple<Path, Paint, Paint?>>()
-
-        // Inherit fill from ancestor <g> elements; SVG default fill is black
-        val fillStack = ArrayDeque<String?>()
-        fillStack.addLast(null) // root default: black
+        var viewBox: FloatArray? = null
+        val shapes = mutableListOf<Triple<Path, Paint?, Paint?>>()
+        val stack = ArrayDeque<SvgStyle>()
+        stack.addLast(SvgStyle(Color.BLACK, null, 1f, false, Paint.Cap.BUTT, Paint.Join.MITER, android.graphics.Matrix()))
+        // Depth of the hidden element being skipped, -1 = none
+        var skipDepth = -1
 
         while (parser.next() != XmlPullParser.END_DOCUMENT) {
             when (parser.eventType) {
-                XmlPullParser.START_TAG -> when (parser.name.lowercase()) {
-                    "svg" -> {
-                        val viewBox = parser.getAttributeValue(null, "viewBox")
-                        if (viewBox != null) {
-                            val parts = viewBox.trim().split(Regex("[,\\s]+"))
-                            if (parts.size >= 4) {
-                                viewportW = parts[2].toFloatOrNull() ?: 24f
-                                viewportH = parts[3].toFloatOrNull() ?: 24f
-                            }
-                        } else {
-                            viewportW = parser.getAttributeValue(null, "width")
-                                ?.replace(Regex("[^0-9.]"), "")?.toFloatOrNull() ?: 24f
-                            viewportH = parser.getAttributeValue(null, "height")
-                                ?.replace(Regex("[^0-9.]"), "")?.toFloatOrNull() ?: 24f
+                XmlPullParser.START_TAG -> {
+                    if (skipDepth >= 0) continue
+                    val tag = parser.name.lowercase()
+                    val inline = parseSvgStyleAttr(parser.getAttributeValue(null, "style") ?: "")
+                    fun attr(name: String): String? = inline[name] ?: parser.getAttributeValue(null, name)?.trim()
+                    if (tag in SVG_NON_RENDERED || attr("display") == "none") {
+                        skipDepth = parser.depth
+                        continue
+                    }
+                    if (tag == "svg" && viewBox == null) viewBox = parseSvgViewBox(parser)
+                    val parent = stack.last()
+                    val matrix = android.graphics.Matrix(parent.matrix)
+                    attr("transform")?.let { applySvgTransform(matrix, it) }
+                    val st = SvgStyle(
+                        fill = svgPaint(attr("fill"), parent.fill),
+                        stroke = svgPaint(attr("stroke"), parent.stroke),
+                        strokeWidth = attr("stroke-width")?.let { svgNumber(it) } ?: parent.strokeWidth,
+                        evenOdd = attr("fill-rule")?.let { it == "evenodd" } ?: parent.evenOdd,
+                        cap = when (attr("stroke-linecap")) {
+                            "round" -> Paint.Cap.ROUND
+                            "square" -> Paint.Cap.SQUARE
+                            "butt" -> Paint.Cap.BUTT
+                            else -> parent.cap
+                        },
+                        join = when (attr("stroke-linejoin")) {
+                            "round" -> Paint.Join.ROUND
+                            "bevel" -> Paint.Join.BEVEL
+                            "miter" -> Paint.Join.MITER
+                            else -> parent.join
+                        },
+                        matrix = matrix
+                    )
+                    // Every element is pushed and popped on its END_TAG (self-closing ones too)
+                    stack.addLast(st)
+                    val path = svgShapePath(tag, parser) ?: continue
+                    path.fillType = if (st.evenOdd) Path.FillType.EVEN_ODD else Path.FillType.WINDING
+                    path.transform(st.matrix)
+                    // The stroke scales with the element's transform
+                    val v = FloatArray(9).also { st.matrix.getValues(it) }
+                    val scale = sqrt(kotlin.math.abs(v[0] * v[4] - v[1] * v[3]))
+                    val fillPaint = st.fill?.takeIf { tag != "line" }?.let { c ->
+                        Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL; color = c }
+                    }
+                    val strokePaint = st.stroke?.takeIf { st.strokeWidth > 0f }?.let { c ->
+                        Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                            style = Paint.Style.STROKE
+                            color = c
+                            strokeWidth = st.strokeWidth * scale
+                            strokeCap = st.cap
+                            strokeJoin = st.join
                         }
                     }
-                    "g" -> {
-                        // Push inherited fill from group (null = inherit from parent)
-                        val gFill = parser.getAttributeValue(null, "fill")
-                            ?: parseSvgStyleAttr(parser.getAttributeValue(null, "style") ?: "")["fill"]
-                        fillStack.addLast(gFill)
-                    }
-                    "path" -> {
-                        val d = parser.getAttributeValue(null, "d") ?: continue
-                        val svgPath = createPathFromData(d) ?: continue
-
-                        val styleMap = parseSvgStyleAttr(parser.getAttributeValue(null, "style") ?: "")
-                        val fillStr = styleMap["fill"]
-                            ?: parser.getAttributeValue(null, "fill")
-                            ?: fillStack.lastOrNull { it != null } // inherit from g ancestors
-                        val strokeStr = styleMap["stroke"] ?: parser.getAttributeValue(null, "stroke")
-                        val strokeWidthStr = styleMap["stroke-width"] ?: parser.getAttributeValue(null, "stroke-width")
-
-                        val fillColor = when {
-                            fillStr == "none" -> null
-                            fillStr != null -> parseSvgColor(fillStr)
-                            else -> Color.BLACK // SVG default
-                        }
-                        val strokeColor = when {
-                            strokeStr == "none" || strokeStr == null -> null
-                            else -> parseSvgColor(strokeStr)
-                        }
-
-                        if (fillColor != null || strokeColor != null) {
-                            val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                                style = Paint.Style.FILL
-                                color = fillColor ?: Color.TRANSPARENT
-                            }
-                            val strokePaint = strokeColor?.let {
-                                Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                                    style = Paint.Style.STROKE
-                                    color = it
-                                    strokeWidth = strokeWidthStr?.replace(Regex("[^0-9.]"), "")
-                                        ?.toFloatOrNull() ?: 1f
-                                }
-                            }
-                            paths.add(Triple(svgPath, fillPaint, strokePaint))
-                        }
-                    }
+                    if (fillPaint != null || strokePaint != null) shapes.add(Triple(path, fillPaint, strokePaint))
                 }
-                XmlPullParser.END_TAG -> if (parser.name.lowercase() == "g") {
-                    if (fillStack.size > 1) fillStack.removeLast()
+                XmlPullParser.END_TAG -> {
+                    if (skipDepth >= 0) {
+                        // The skipped element itself was never pushed
+                        if (parser.depth == skipDepth) skipDepth = -1
+                        continue
+                    }
+                    if (stack.size > 1) stack.removeLast()
                 }
             }
         }
 
-        if (paths.isEmpty()) {
-            android.util.Log.e("OxygenOSMaterialIcons", "parseSvgXml: no renderable paths found (vp=${viewportW}x${viewportH})")
+        if (shapes.isEmpty()) {
+            de.robv.android.xposed.XposedBridge.log("OxygenOSMaterialIcons parseSvgXml: no renderable shapes")
             return null
         }
 
+        val vb = viewBox ?: floatArrayOf(0f, 0f, 24f, 24f)
         val density = context.resources.displayMetrics.density
         val size = (24 * density).toInt().coerceAtLeast(48)
         val bitmap = createBitmap(size, size)
         val canvas = Canvas(bitmap)
-        canvas.scale(size / viewportW, size / viewportH)
-        for ((path, fill, stroke) in paths) {
-            if (fill.color != Color.TRANSPARENT) canvas.drawPath(path, fill)
-            if (stroke != null) canvas.drawPath(path, stroke)
+        canvas.scale(size / vb[2], size / vb[3])
+        // Material Symbols use a shifted viewBox ("0 -960 960 960")
+        canvas.translate(-vb[0], -vb[1])
+        for ((path, fill, stroke) in shapes) {
+            fill?.let { canvas.drawPath(path, it) }
+            stroke?.let { canvas.drawPath(path, it) }
         }
         return BitmapDrawable(context.resources, bitmap)
+    }
+
+    private fun parseSvgViewBox(parser: XmlPullParser): FloatArray {
+        parser.getAttributeValue(null, "viewBox")?.trim()?.split(Regex("[,\\s]+"))
+            ?.mapNotNull { it.toFloatOrNull() }
+            ?.takeIf { it.size == 4 && it[2] > 0f && it[3] > 0f }
+            ?.let { return it.toFloatArray() }
+        val w = parser.getAttributeValue(null, "width")?.let { svgNumber(it) }?.takeIf { it > 0f } ?: 24f
+        val h = parser.getAttributeValue(null, "height")?.let { svgNumber(it) }?.takeIf { it > 0f } ?: 24f
+        return floatArrayOf(0f, 0f, w, h)
+    }
+
+    private fun svgShapePath(tag: String, parser: XmlPullParser): Path? {
+        fun num(name: String): Float? = parser.getAttributeValue(null, name)?.let { svgNumber(it) }
+        fun n(name: String): Float = num(name) ?: 0f
+        return when (tag) {
+            "path" -> parser.getAttributeValue(null, "d")?.let { createPathFromData(it) }
+            "line" -> Path().apply { moveTo(n("x1"), n("y1")); lineTo(n("x2"), n("y2")) }
+            "rect" -> {
+                val x = n("x"); val y = n("y"); val w = n("width"); val h = n("height")
+                if (w <= 0f || h <= 0f) return null
+                val rx = (num("rx") ?: num("ry") ?: 0f).coerceAtMost(w / 2)
+                val ry = (num("ry") ?: num("rx") ?: 0f).coerceAtMost(h / 2)
+                Path().apply { addRoundRect(android.graphics.RectF(x, y, x + w, y + h), rx, ry, Path.Direction.CW) }
+            }
+            "circle" -> n("r").takeIf { it > 0f }?.let { r ->
+                Path().apply { addCircle(n("cx"), n("cy"), r, Path.Direction.CW) }
+            }
+            "ellipse" -> {
+                val rx = n("rx"); val ry = n("ry")
+                if (rx <= 0f || ry <= 0f) return null
+                val cx = n("cx"); val cy = n("cy")
+                Path().apply { addOval(android.graphics.RectF(cx - rx, cy - ry, cx + rx, cy + ry), Path.Direction.CW) }
+            }
+            "polygon", "polyline" -> {
+                val pts = parser.getAttributeValue(null, "points")?.trim()?.split(Regex("[,\\s]+"))
+                    ?.mapNotNull { it.toFloatOrNull() } ?: return null
+                if (pts.size < 4) return null
+                Path().apply {
+                    moveTo(pts[0], pts[1])
+                    var i = 2
+                    while (i + 1 < pts.size) { lineTo(pts[i], pts[i + 1]); i += 2 }
+                    if (tag == "polygon") close()
+                }
+            }
+            else -> null
+        }
+    }
+
+    private fun applySvgTransform(matrix: android.graphics.Matrix, transform: String) {
+        for (m in Regex("(\\w+)\\s*\\(([^)]*)\\)").findAll(transform)) {
+            val a = m.groupValues[2].trim().split(Regex("[,\\s]+")).mapNotNull { it.toFloatOrNull() }
+            val t = android.graphics.Matrix()
+            when (m.groupValues[1]) {
+                "translate" -> t.setTranslate(a.getOrElse(0) { 0f }, a.getOrElse(1) { 0f })
+                "scale" -> { val sx = a.getOrElse(0) { 1f }; t.setScale(sx, a.getOrElse(1) { sx }) }
+                "rotate" -> if (a.size >= 3) t.setRotate(a[0], a[1], a[2]) else t.setRotate(a.getOrElse(0) { 0f })
+                "skewX" -> t.setSkew(kotlin.math.tan(Math.toRadians(a.getOrElse(0) { 0f }.toDouble())).toFloat(), 0f)
+                "skewY" -> t.setSkew(0f, kotlin.math.tan(Math.toRadians(a.getOrElse(0) { 0f }.toDouble())).toFloat())
+                "matrix" -> if (a.size == 6) t.setValues(floatArrayOf(a[0], a[2], a[4], a[1], a[3], a[5], 0f, 0f, 1f))
+            }
+            matrix.preConcat(t)
+        }
+    }
+
+    private fun svgNumber(s: String): Float? =
+        Regex("^[-+]?(\\d*\\.\\d+|\\d+\\.?)([eE][-+]?\\d+)?").find(s.trim())?.value?.toFloatOrNull()
+
+    /** null value = inherit, "none" = no paint. */
+    private fun svgPaint(value: String?, inherited: Int?): Int? = when (value) {
+        null, "inherit" -> inherited
+        "none", "transparent" -> null
+        else -> parseSvgColor(value)
     }
 
     private fun parseSvgStyleAttr(style: String): Map<String, String> {
@@ -313,8 +454,15 @@ object IconUtils {
         return map
     }
 
-    private fun parseSvgColor(colorStr: String): Int? =
-        try { Color.parseColor(colorStr.trim()) } catch (_: Throwable) { null }
+    // Notification icons only use alpha: anything unparseable (currentColor, url(#gradient),
+    // rgb(...)) is drawn opaque rather than dropped
+    private fun parseSvgColor(colorStr: String): Int {
+        val c = colorStr.trim()
+        if (Regex("#[0-9a-fA-F]{3}").matches(c)) {
+            return Color.parseColor("#" + c.drop(1).map { "$it$it" }.joinToString(""))
+        }
+        return try { Color.parseColor(c) } catch (_: Throwable) { Color.BLACK }
+    }
 
     private fun createPathFromData(pathData: String): Path? {
         return try {
@@ -350,52 +498,69 @@ object IconUtils {
         val path = when (variant) {
             "shade" -> ChannelIconStore.getShadePath(pkg, channelId)
             "aod"   -> ChannelIconStore.getAodPath(pkg, channelId)
-            else    -> { ChannelIconStore.reload(); ChannelIconStore.getPath(pkg, channelId) }
+            else    -> ChannelIconStore.getPath(pkg, channelId)
         } ?: return null
+        val mtime = try { File(path).lastModified() } catch (_: Throwable) { 0L }
+        val iconKey = "$path:$mtime"
+        channelIconByKey[iconKey]?.let { return it }
         val d = loadDrawableFromXmlPath(path, context)
         if (d == null) {
             android.util.Log.e("OxygenOSMaterialIcons", "channelOverrideIcon[$pkg/$channelId/$variant]: drawable=null path=$path")
             return null
         }
-        return Icon.createWithBitmap(d.toBitmap())
+        val icon = Icon.createWithBitmap(d.toBitmap())
+        evictIfNeeded(channelIconByKey, 40)
+        channelIconByKey[iconKey] = icon
+        return icon
     }
 
+    /** True if [icon] is one of the channel-override bitmaps produced by this module. */
+    fun isChannelOverrideIcon(icon: Icon): Boolean = channelIconByKey.containsValue(icon)
+
     fun customSmallIcon(pkg: String, notification: Notification? = null, context: Context? = null): Icon? {
-        if (!PreferenceUtils.isModuleEnabled()) return null
+        if (!PreferenceUtils.isCustomIconsEnabled()) return null
+        val channelId = try { notification?.channelId } catch (_: Throwable) { null } ?: ""
+        val category = try { notification?.category } catch (_: Throwable) { null }
+        val res = customIconRes(pkg, channelId, category) ?: return null
+        if (!PreferenceUtils.isCustomIconEnabled(pkg, channelId)) return null
+        return Icon.createWithResource(PreferenceUtils.MODULE_PKG, res)
+    }
 
-        val resId = CUSTOM_SMALL_ICONS[pkg]
-        if (resId != null) return Icon.createWithResource(PreferenceUtils.MODULE_PKG, resId)
+    /**
+     * Author icon for a notification of [pkg] in [channelId], ignoring the user's switches.
+     * The settings screen has no notification at hand and passes a category guessed from the channel.
+     */
+    fun customIconRes(pkg: String, channelId: String, category: String?): Int? {
+        CUSTOM_SMALL_ICONS[pkg]?.let { return it }
 
-        if (notification != null) {
-            val channelId = try { notification.channelId } catch (_: Throwable) { null } ?: ""
-            val category = try { notification.category } catch (_: Throwable) { null }
-
-            if (pkg == "com.android.systemui") {
-                val isBattery = channelId.contains("battery", ignoreCase = true) ||
-                    channelId.contains("bat", ignoreCase = true) ||
-                    channelId.contains("CRG", ignoreCase = true) ||
-                    channelId.contains("charge", ignoreCase = true) ||
-                    channelId.contains("power", ignoreCase = true) ||
-                    channelId.contains("low", ignoreCase = true) ||
-                    (category != null && category.contains("battery", ignoreCase = true))
-                if (isBattery) {
-                    return Icon.createWithResource(PreferenceUtils.MODULE_PKG, R.drawable.ic_notify_battery_full)
-                }
-            }
-
-            if (category == Notification.CATEGORY_MISSED_CALL ||
-                channelId.contains("missed", ignoreCase = true)
-            ) {
-                return Icon.createWithResource(PreferenceUtils.MODULE_PKG, R.drawable.ic_notify_missed_call)
-            }
+        if (pkg == "com.android.systemui") {
+            val isBattery = channelId.contains("battery", ignoreCase = true) ||
+                channelId.contains("bat", ignoreCase = true) ||
+                channelId.contains("CRG", ignoreCase = true) ||
+                channelId.contains("charge", ignoreCase = true) ||
+                channelId.contains("power", ignoreCase = true) ||
+                channelId.contains("low", ignoreCase = true) ||
+                (category != null && category.contains("battery", ignoreCase = true))
+            if (isBattery) return R.drawable.ic_notify_battery_full
         }
 
+        // Missed call: system telephony packages only — third-party apps (e.g. Teams)
+        // also use CATEGORY_MISSED_CALL and must keep their own icons
+        if (pkg in SYSTEM_DIALER_PKGS && category == Notification.CATEGORY_MISSED_CALL) {
+            return R.drawable.ic_notify_missed_call
+        }
         return null
     }
 
     fun getIconCacheKey(icon: Icon, pkg: String): String? {
         try {
             val type = XposedHelpers.getIntField(icon, "mType")
+            // Bitmap / adaptive-bitmap icons have no resource id - key them by pixel content,
+            // otherwise all bitmap icons of a package (e.g. Teams missed call vs chat) share one entry
+            if (type == 1 || type == 5) {
+                val bmp = XposedHelpers.callMethod(icon, "getBitmap") as? Bitmap ?: return null
+                return "fallback_${pkg}_${bitmapHash(bmp)}"
+            }
             if (type != 2) return null
             val resId = try {
                 icon.javaClass.getDeclaredMethod("getResId").apply { isAccessible = true }.invoke(icon) as Int
@@ -409,11 +574,18 @@ object IconUtils {
     }
 
     fun getCachedMonochrome(icon: Icon?, pkg: String, drawable: Drawable, rawPath: Boolean = false): Drawable {
-        val baseKey = icon?.let { getIconCacheKey(it, pkg) } ?: "fallback_$pkg"
+        val baseKey = icon?.let { getIconCacheKey(it, pkg) }
+            ?: "fallback_${pkg}_${try { bitmapHash(drawable.toBitmap()) } catch (_: Throwable) { 0 }}"
         val key = if (rawPath) "${baseKey}_raw" else baseKey
         evictIfNeeded(monochromeCache, MAX_MONOCHROME_CACHE)
         val cached = monochromeCache.getOrPut(key) { ensureMonochrome(drawable) }
         return cached.constantState?.newDrawable()?.mutate() ?: cached
+    }
+
+    private fun bitmapHash(bmp: Bitmap): Int {
+        val pixels = IntArray(bmp.width * bmp.height)
+        bmp.getPixels(pixels, 0, bmp.width, 0, 0, bmp.width, bmp.height)
+        return 31 * (31 * bmp.width + bmp.height) + pixels.contentHashCode()
     }
 
     fun getCachedMonochromeFallback(pkg: String, drawable: Drawable): Drawable {

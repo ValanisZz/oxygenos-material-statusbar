@@ -23,6 +23,12 @@
             android:name="xposedscope"
             android:resource="@array/xposed_scope" />
 
+        <!-- Channel icons picked in Settings, read by SystemUI / AOD (no root, no storage access) -->
+        <provider
+            android:name=".IconProvider"
+            android:authorities="ru.valanis.oneplus.statusbar.material.icons"
+            android:exported="true" />
+
     </application>
 
 </manifest>

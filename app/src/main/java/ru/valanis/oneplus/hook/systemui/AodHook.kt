@@ -38,6 +38,15 @@ object AodHook {
         name.startsWith("com.oplus.aod")
     }
 
+    // SBN patching is only useful where notifications are stored or rendered.
+    // The Zygote hooks are inherited by every app process — everywhere else they
+    // must be a cheap no-op (no prefs reload, no file IO).
+    private val isSbnPatchProcess: Boolean by lazy {
+        val name = detectProcessName()
+        name == "android" || name == "system_server" ||
+            name.startsWith("com.android.systemui") || name.startsWith("com.oplus.aod")
+    }
+
     private fun detectProcessName(): String {
         try {
             val at = Class.forName("android.app.ActivityThread")
@@ -65,11 +74,11 @@ object AodHook {
         val cfgClass = Class.forName("com.oplus.content.OplusFeatureConfigManager")
         XposedBridge.hookAllMethods(cfgClass, "hasFeature", object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
-                if (!PreferenceUtils.isAodEnabled()) return
+                // hasFeature is extremely hot — compare the string before touching prefs
                 val feature = param.args.getOrNull(0) as? String ?: return
-                if (feature == "oplus.software.display.aod_ramless_support") {
-                    param.result = false
-                }
+                if (feature != "oplus.software.display.aod_ramless_support") return
+                if (!PreferenceUtils.isAodEnabled()) return
+                param.result = false
             }
         })
     }
@@ -170,7 +179,7 @@ object AodHook {
 
         XposedBridge.hookAllMethods(sbnClass, "getNotification", object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
-                if (!PreferenceUtils.isModuleEnabled()) return
+                if (!isSbnPatchProcess || !PreferenceUtils.isModuleEnabled()) return
                 try {
                     val pkg = XposedHelpers.getObjectField(param.thisObject, "pkg") as? String ?: return
                     val notification = param.result as? Notification ?: return
@@ -185,16 +194,9 @@ object AodHook {
                         }
                         return
                     }
-                    // Skip re-resolution only when there is definitely no channel override
-                    // configured for this notification.  If a channel override exists (even if
-                    // it failed to load before), always re-resolve so a freshly copied icon
-                    // file is picked up without needing to restart the AOD process.
-                    if (pkg != "com.android.systemui" && IconUtils.iconCache.containsKey(pkg)) {
-                        val channelId = try { notification.channelId } catch (_: Throwable) { null }
-                        val hasOverride = !channelId.isNullOrEmpty() &&
-                            ru.valanis.oneplus.hook.core.ChannelIconStore.getAodPath(pkg, channelId) != null
-                        if (!hasOverride) return
-                    }
+                    // Always re-resolve: the cache is package-keyed, so a notification-specific
+                    // icon (e.g. the missed-call heuristic) must not stick to the package and
+                    // leak onto later notifications — the latest notification wins.
                     val icon = resolveIconForAod(pkg, notification) ?: return
                     IconUtils.iconCache[pkg] = icon
                 } catch (_: Throwable) {}
@@ -203,7 +205,7 @@ object AodHook {
 
         XposedBridge.hookAllMethods(sbnClass, "getPackageName", object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
-                if (!PreferenceUtils.isModuleEnabled()) return
+                if (!isSbnPatchProcess || !PreferenceUtils.isModuleEnabled()) return
                 val pkg = param.result as? String ?: return
                 try {
                     val notification = XposedHelpers.getObjectField(param.thisObject, "notification") as? Notification ?: return
@@ -215,12 +217,6 @@ object AodHook {
                             IconUtils.iconCache[pkg] = patchedIcon
                         }
                         return
-                    }
-                    if (pkg != "com.android.systemui" && IconUtils.iconCache.containsKey(pkg)) {
-                        val channelId = try { notification.channelId } catch (_: Throwable) { null }
-                        val hasOverride = !channelId.isNullOrEmpty() &&
-                            ru.valanis.oneplus.hook.core.ChannelIconStore.getAodPath(pkg, channelId) != null
-                        if (!hasOverride) return
                     }
                     val icon = resolveIconForAod(pkg, notification) ?: return
                     IconUtils.iconCache[pkg] = icon
@@ -324,11 +320,10 @@ object AodHook {
             )
             XposedBridge.hookAllMethods(cfgClass, "hasFeature", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
-                    if (!PreferenceUtils.isAodEnabled()) return
                     val feature = param.args.getOrNull(0) as? String ?: return
-                    if (feature == "oplus.software.display.aod_ramless_support") {
-                        param.result = false
-                    }
+                    if (feature != "oplus.software.display.aod_ramless_support") return
+                    if (!PreferenceUtils.isAodEnabled()) return
+                    param.result = false
                 }
             })
         } catch (t: Throwable) {
@@ -540,7 +535,8 @@ object AodHook {
                                 val smallDrawable = cachedIcon.loadDrawable(pkgContext)
                                 if (smallDrawable != null) {
                                     val mono = IconUtils.getCachedMonochrome(cachedIcon, pkg, smallDrawable)
-                                    val baseKey = IconUtils.getIconCacheKey(cachedIcon, pkg) ?: "fallback_$pkg"
+                                    // No content key -> skip fit caching rather than share one entry per package
+                                    val baseKey = IconUtils.getIconCacheKey(cachedIcon, pkg)
                                     val fitted = IconUtils.fitToSize(mono, targetW, targetH, context.resources, baseKey)
                                     java.lang.reflect.Array.set(drawables, i, fitted)
                                     continue

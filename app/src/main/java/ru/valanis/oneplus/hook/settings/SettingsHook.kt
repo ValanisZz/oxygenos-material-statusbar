@@ -330,10 +330,33 @@ object SettingsHook {
         }
 
         hookWidgetIconPreview(lpparam)
+        hookFullWidthDivider(lpparam)
         XposedBridge.log("$TAG: Settings hook OK (${lpparam.packageName}) pid=${Process.myPid()}")
         } catch (t: Throwable) {
             XposedBridge.log("$TAG Settings: ${t.message}")
         }
+    }
+
+    /**
+     * COUI starts a row's divider at its title view (getDividerStartAlignView), which leaves the
+     * icon column of the custom-icons app list undivided. Returning null makes the decoration use
+     * the default start inset, so the divider spans the row like on the other screens.
+     */
+    private fun hookFullWidthDivider(lpparam: XC_LoadPackage.LoadPackageParam) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                "com.coui.appcompat.preference.COUIPreference", lpparam.classLoader,
+                "getDividerStartAlignView",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val key = try {
+                            XposedHelpers.callMethod(param.thisObject, "getKey") as? String
+                        } catch (_: Throwable) { null } ?: return
+                        if (key.startsWith(SettingsScreenBuilder.CUSTOM_ICONS_ENTRY_KEY_PREFIX)) param.result = null
+                    }
+                }
+            )
+        } catch (_: Throwable) {}
     }
 
     /**
@@ -354,13 +377,21 @@ object SettingsHook {
                         val key = try {
                             XposedHelpers.callMethod(param.thisObject, "getKey") as? String
                         } catch (_: Throwable) { return }
-                        if (key !in ChannelNotificationIconInjector.ICON_PREF_KEYS) return
                         val holder = param.args?.getOrNull(0) ?: return
                         val itemView: View = try {
                             XposedHelpers.getObjectField(holder, "itemView") as? View
                         } catch (_: Throwable) {
                             try { XposedHelpers.callMethod(holder, "itemView") as? View } catch (_: Throwable) { null }
                         } ?: return
+                        try {
+                            val enabled = XposedHelpers.callMethod(param.thisObject, "isEnabled") as? Boolean ?: true
+                            // Switch rows: the preview is also dimmed while the row's own switch is off
+                            val checked = try {
+                                XposedHelpers.callMethod(param.thisObject, "isChecked") as? Boolean
+                            } catch (_: Throwable) { null } ?: true
+                            SettingsScreenBuilder.bindCustomIconPreview(key, itemView, enabled && checked)
+                        } catch (_: Throwable) {}
+                        if (key !in ChannelNotificationIconInjector.ICON_PREF_KEYS) return
                         val widgetFrame = try {
                             itemView.findViewById<android.view.ViewGroup>(android.R.id.widget_frame)
                         } catch (_: Throwable) { null } ?: return
@@ -372,6 +403,13 @@ object SettingsHook {
                             val iv = android.widget.ImageView(itemView.context)
                             iv.setImageDrawable(drawable)
                             iv.scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+                            // Notification icons are monochrome (usually black): tint with the
+                            // theme text color so the preview stays visible in dark mode
+                            try {
+                                val a = itemView.context.obtainStyledAttributes(intArrayOf(android.R.attr.textColorPrimary))
+                                iv.imageTintList = a.getColorStateList(0)
+                                a.recycle()
+                            } catch (_: Throwable) {}
                             widgetFrame.addView(iv, android.view.ViewGroup.LayoutParams(size, size))
                             widgetFrame.visibility = View.VISIBLE
                         } else {
