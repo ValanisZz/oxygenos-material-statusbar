@@ -7,12 +7,10 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.Parcelable
-import android.provider.DocumentsContract
-import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.util.Log
 import android.app.NotificationManager
 import android.widget.Toast
@@ -21,6 +19,7 @@ import de.robv.android.xposed.XposedHelpers
 import ru.valanis.oneplus.hook.core.ChannelIconStore
 import ru.valanis.oneplus.hook.core.PreferenceUtils
 import ru.valanis.oneplus.statusbar.material.ChannelIconJsonWriter
+import ru.valanis.oneplus.statusbar.material.IconProvider
 import ru.valanis.oneplus.statusbar.material.R
 import kotlin.math.max
 
@@ -39,14 +38,13 @@ object ChannelNotificationIconInjector {
     private const val PREF_KEY_ICON_PATH       = "oxygen_material_icon_path"
     private const val PREF_KEY_ICON_PATH_SHADE = "oxygen_material_icon_path_shade"
     private const val PREF_KEY_ICON_PATH_AOD   = "oxygen_material_icon_path_aod"
-    private const val PREF_KEY_ICON_MONO       = "oxygen_material_icon_mono"
 
     /** Request code for the system file picker launched from within the injected preference. */
     const val FILE_PICKER_REQUEST_CODE = 0x4943  // "IC" = Icon Chooser
 
-    /** Pending callback set before startActivityForResult; invoked with the resolved file path. */
+    /** Pending callback set before startActivityForResult; invoked with the stored icon URI, null on failure. */
     @Volatile
-    var pendingFilePickerCallback: ((String) -> Unit)? = null
+    var pendingFilePickerCallback: ((String?) -> Unit)? = null
 
     /** Keys of the three icon picker preferences — used by the onBindViewHolder hook. */
     val ICON_PREF_KEYS = setOf(
@@ -187,87 +185,57 @@ object ChannelNotificationIconInjector {
         val uri = data?.data ?: return
         // Run I/O on a background thread; deliver result on main thread.
         Thread {
-            val originalPath = resolveUriToPath(activity, uri)
-            // Copy to /data/system/ so SystemUI/AOD processes can read it.
-            val systemPath = copyToSystemIcons(activity, uri, originalPath)
-            Handler(Looper.getMainLooper()).post {
-                callback(systemPath ?: originalPath ?: uri.toString())
-            }
+            val iconUri = copyToModule(activity, uri)
+            Handler(Looper.getMainLooper()).post { callback(iconUri) }
         }.start()
     }
 
     /**
-     * Copies the selected icon file to /data/system/[MODULE_PKG]_icons/ via root so that
-     * SystemUI and com.oplus.aod processes (which have no access to external storage) can
-     * read it.  Returns the system-side absolute path on success, null on failure.
+     * Copies the picked file into the module's own storage ([IconProvider]): SystemUI and AOD
+     * can't read the picker's URI, and the copy no longer depends on the original file.
+     * Returns the provider URI, or null on failure.
      */
-    private fun copyToSystemIcons(context: Context, uri: Uri, originalPath: String?): String? {
-        // Determine extension from original path or MIME type.
-        val ext = originalPath
-            ?.substringAfterLast('.', "")
-            ?.takeIf { it.length in 1..5 }
-            ?: try {
-                val mime = context.contentResolver.getType(uri) ?: ""
-                when {
-                    mime.contains("svg") -> "svg"
-                    mime.contains("xml") -> "xml"
-                    mime.contains("png") -> "png"
-                    mime.contains("webp") -> "webp"
-                    mime.contains("jpeg") || mime.contains("jpg") -> "jpg"
-                    else -> "bin"
-                }
-            } catch (_: Throwable) { "bin" }
-
-        // Read file bytes — ContentResolver has the URI permission in this (Settings) process.
-        val bytes = try {
-            context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-        } catch (_: Throwable) { null }
-            ?: originalPath?.let { try { java.io.File(it).readBytes() } catch (_: Throwable) { null } }
-            ?: return null
-
-        val dir = "/data/system/${PreferenceUtils.MODULE_PKG}_icons"
-        val name = "icon_${(uri.toString().hashCode() and 0x7FFFFFFF)}.$ext"
-        val destPath = "$dir/$name"
-
+    private fun copyToModule(context: Context, uri: Uri): String? {
         return try {
-            val process = ProcessBuilder(
-                "su", "-c",
-                "mkdir -p '$dir' && chmod 755 '$dir' && cat > '$destPath' && chmod 644 '$destPath'"
-            ).redirectErrorStream(true).start()
-            process.outputStream.use { it.write(bytes) }
-            val exitCode = process.waitFor()
-            if (exitCode == 0) destPath else null
-        } catch (_: Throwable) { null }
-    }
-
-    private fun resolveUriToPath(context: Context, uri: Uri): String? {
-        if (uri.scheme == "file") return uri.path
-        try {
-            if (DocumentsContract.isDocumentUri(context, uri)) {
-                val docId = DocumentsContract.getDocumentId(uri)
-                val split = docId.split(":")
-                if (split.size == 2 && split[0].equals("primary", ignoreCase = true)) {
-                    return "${Environment.getExternalStorageDirectory()}/${split[1]}"
+            val resolver = context.contentResolver
+            val bytes = resolver.openInputStream(uri)?.use { it.readBytes() } ?: return null
+            val displayName = try {
+                resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                    if (c.moveToFirst()) c.getString(0) else null
                 }
-            }
-        } catch (_: Throwable) {}
-        try {
-            context.contentResolver.query(
-                uri, arrayOf(MediaStore.MediaColumns.DATA), null, null, null
-            )?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val idx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
-                    if (idx >= 0) return cursor.getString(idx)
+            } catch (_: Throwable) { null }
+            val ext = displayName?.substringAfterLast('.', "")?.lowercase()?.takeIf { it.length in 1..5 }
+                ?: resolver.getType(uri).orEmpty().let { mime ->
+                    when {
+                        mime.contains("svg") -> "svg"
+                        mime.contains("xml") -> "xml"
+                        mime.contains("png") -> "png"
+                        mime.contains("webp") -> "webp"
+                        mime.contains("jpeg") || mime.contains("jpg") -> "jpg"
+                        else -> "bin"
+                    }
                 }
-            }
-        } catch (_: Throwable) {}
-        return null
+            val base = displayName?.substringBeforeLast('.')
+                ?.replace(Regex("[^A-Za-z0-9_-]"), "_")?.take(40)?.ifEmpty { null } ?: "icon"
+            // Named by content: a changed icon gets a new URI, so no reader keeps a stale copy
+            val hash = java.security.MessageDigest.getInstance("SHA-1").digest(bytes)
+                .take(6).joinToString("") { "%02x".format(it) }
+            val target = IconProvider.uri("${base}_$hash.$ext")
+            resolver.openOutputStream(target, "wt")?.use { it.write(bytes) } ?: return null
+            target.toString()
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG channelIcon: copy to module failed: ${t.message}")
+            null
+        }
     }
 
     private fun trySetIconPreview(pref: Any, path: String, context: Context) {
         val key = try { XposedHelpers.callMethod(pref, "getKey") as? String } catch (_: Throwable) { null }
         val drawable = if (path.isNotEmpty()) loadDrawableFromPath(path, context) else null
-        if (key != null) iconPreviews[key] = drawable
+        // ConcurrentHashMap rejects null values: a failed load (or a reset) must remove the entry
+        if (key != null) {
+            if (drawable != null) iconPreviews[key] = drawable else iconPreviews.remove(key)
+        }
         try { XposedHelpers.callMethod(pref, "notifyChanged") } catch (_: Throwable) {}
     }
 
@@ -286,7 +254,7 @@ object ChannelNotificationIconInjector {
         val context = try { XposedHelpers.callMethod(fragment, "getContext") as? Context } catch (_: Throwable) { null } ?: return
         val prefScreen = screen ?: return
         val allowed = isChannelNotificationsAllowed(context, pkg, channelId)
-        for (key in listOf(PREF_KEY_ICON_ENABLED, PREF_KEY_ICON_PATH, PREF_KEY_ICON_PATH_SHADE, PREF_KEY_ICON_PATH_AOD, PREF_KEY_ICON_MONO)) {
+        for (key in listOf(PREF_KEY_ICON_ENABLED, PREF_KEY_ICON_PATH, PREF_KEY_ICON_PATH_SHADE, PREF_KEY_ICON_PATH_AOD)) {
             val p = PreferenceHelper.findByKey(prefScreen, key) ?: continue
             try { XposedHelpers.callMethod(p, "setVisible", allowed) } catch (_: Throwable) {}
         }
@@ -589,60 +557,14 @@ object ChannelNotificationIconInjector {
             context.createPackageContext(PreferenceUtils.MODULE_PKG, Context.CONTEXT_IGNORE_SECURITY)
         } catch (_: Throwable) { context }
 
-        // ── Load current state from disk ──────────────────────────────
-        val map = try { ChannelIconJsonWriter.readMapFromDisk() } catch (_: Throwable) { mutableMapOf() }
+        // ── Load current state from the module ────────────────────────
+        val map = ChannelIconJsonWriter.readMap(context)
         val storeKey = ChannelIconStore.storeKey(pkg, channelId)
         val currentPathHolder      = arrayOf(map[storeKey] ?: "")
         val currentShadePathHolder = arrayOf(map["$storeKey${ChannelIconStore.SHADE_SUFFIX}"] ?: "")
         val currentAodPathHolder   = arrayOf(map["$storeKey${ChannelIconStore.AOD_SUFFIX}"]   ?: "")
-        val isMonoHolder = arrayOf(map["$storeKey${ChannelIconStore.MONO_SUFFIX}"] == "true")
         val isEnabledInit = currentPathHolder[0].isNotEmpty() ||
             currentShadePathHolder[0].isNotEmpty() || currentAodPathHolder[0].isNotEmpty()
-
-        // ── Migrate external-storage paths to /data/system/ ──────────
-        // Existing icons saved with paths like /storage/emulated/0/... are unreadable by
-        // SystemUI and AOD processes. Copy them to /data/system/ once, transparently.
-        Thread {
-            var migrated = false
-            val holders = listOf(
-                Triple(currentPathHolder, storeKey, "main"),
-                Triple(currentShadePathHolder, "$storeKey${ChannelIconStore.SHADE_SUFFIX}", "shade"),
-                Triple(currentAodPathHolder, "$storeKey${ChannelIconStore.AOD_SUFFIX}", "aod")
-            )
-            for ((holder, key, label) in holders) {
-                val oldPath = holder[0]
-                if (oldPath.isEmpty()) continue
-                if (oldPath.startsWith("/data/system/")) continue  // already system path
-                try {
-                    val bytes = java.io.File(oldPath).readBytes()
-                    val ext = oldPath.substringAfterLast('.', "bin").takeIf { it.length in 1..5 } ?: "bin"
-                    val dir = "/data/system/${PreferenceUtils.MODULE_PKG}_icons"
-                    val name = "icon_${(oldPath.hashCode() and 0x7FFFFFFF)}.$ext"
-                    val destPath = "$dir/$name"
-                    val process = ProcessBuilder("su", "-c",
-                        "mkdir -p '$dir' && chmod 755 '$dir' && cat > '$destPath' && chmod 644 '$destPath'"
-                    ).redirectErrorStream(true).start()
-                    process.outputStream.use { it.write(bytes) }
-                    if (process.waitFor() == 0) {
-                        holder[0] = destPath
-                        migrated = true
-                        XposedBridge.log("$TAG channelIcon: migrated $label path for $pkg/$channelId")
-                    }
-                } catch (_: Throwable) {}
-            }
-            if (migrated) {
-                // Persist migrated paths back to disk.
-                try {
-                    val updatedMap = ChannelIconJsonWriter.readMapFromDisk().toMutableMap()
-                    for ((holder, key, _) in holders) {
-                        val p = holder[0]
-                        if (p.isEmpty()) updatedMap.remove(key) else updatedMap[key] = p
-                    }
-                    ChannelIconJsonWriter.writeMapToDisk(updatedMap)
-                    ChannelIconStore.invalidateCache()
-                } catch (_: Throwable) {}
-            }
-        }.start()
 
         // ── Find preference classes ───────────────────────────────────
         val prefClass = try { XposedHelpers.findClass("androidx.preference.Preference", classLoader) }
@@ -679,8 +601,8 @@ object ChannelNotificationIconInjector {
         val titleShade    = str(R.string.channel_icon_file_shade, "Notification shade icon")
         val titleAod      = str(R.string.channel_icon_file_aod, "AOD icon")
         val hintPath      = str(R.string.channel_icon_path_hint, "Tap to select icon file")
-        val titleMono     = str(R.string.pref_shade_group_mono, "Monochrome in shade")
-        val comingSoon    = str(R.string.pref_coming_soon, "Coming soon")
+        // Stored icons are provider URIs: show just the file name
+        fun summaryOf(path: String) = path.substringAfterLast('/').ifEmpty { hintPath }
         val toastFailed   = str(R.string.channel_icon_save_failed, "Could not save")
 
         // ── Find existing native PreferenceCategory for style/class matching ──
@@ -716,18 +638,19 @@ object ChannelNotificationIconInjector {
         // ── Auto-save helper ──────────────────────────────────────────
         fun autoSave() {
             Thread {
-                val newMap = try { ChannelIconJsonWriter.readMapFromDisk() } catch (_: Throwable) { mutableMapOf() }.toMutableMap()
-                val path = currentPathHolder[0]
-                if (path.isEmpty()) newMap.remove(storeKey) else newMap[storeKey] = path
-                val shadePath = currentShadePathHolder[0]
-                val shadeKey = "$storeKey${ChannelIconStore.SHADE_SUFFIX}"
-                if (shadePath.isEmpty()) newMap.remove(shadeKey) else newMap[shadeKey] = shadePath
-                val aodPath = currentAodPathHolder[0]
-                val aodKey = "$storeKey${ChannelIconStore.AOD_SUFFIX}"
-                if (aodPath.isEmpty()) newMap.remove(aodKey) else newMap[aodKey] = aodPath
-                val monoKey = "$storeKey${ChannelIconStore.MONO_SUFFIX}"
-                newMap[monoKey] = "true"  // always true (coming soon feature)
-                if (!ChannelIconJsonWriter.writeMapToDisk(newMap)) {
+                val saved = ChannelIconJsonWriter.update(context) { newMap ->
+                    val path = currentPathHolder[0]
+                    if (path.isEmpty()) newMap.remove(storeKey) else newMap[storeKey] = path
+                    val shadePath = currentShadePathHolder[0]
+                    val shadeKey = "$storeKey${ChannelIconStore.SHADE_SUFFIX}"
+                    if (shadePath.isEmpty()) newMap.remove(shadeKey) else newMap[shadeKey] = shadePath
+                    val aodPath = currentAodPathHolder[0]
+                    val aodKey = "$storeKey${ChannelIconStore.AOD_SUFFIX}"
+                    if (aodPath.isEmpty()) newMap.remove(aodKey) else newMap[aodKey] = aodPath
+                    val monoKey = "$storeKey${ChannelIconStore.MONO_SUFFIX}"
+                    newMap[monoKey] = "true"  // always true (coming soon feature)
+                }
+                if (!saved) {
                     Handler(Looper.getMainLooper()).post {
                         Toast.makeText(context, toastFailed, Toast.LENGTH_LONG).show()
                     }
@@ -762,7 +685,7 @@ object ChannelNotificationIconInjector {
             }
             XposedHelpers.callMethod(p, "setKey", PREF_KEY_ICON_PATH)
             XposedHelpers.callMethod(p, "setTitle", titleFile)
-            XposedHelpers.callMethod(p, "setSummary", currentPathHolder[0].ifEmpty { hintPath })
+            XposedHelpers.callMethod(p, "setSummary", summaryOf(currentPathHolder[0]))
             XposedHelpers.callMethod(p, "setPersistent", false)
             XposedHelpers.callMethod(p, "setEnabled", isEnabledInit)
             if (currentPathHolder[0].isNotEmpty()) trySetIconPreview(p, currentPathHolder[0], context)
@@ -778,7 +701,7 @@ object ChannelNotificationIconInjector {
             }
             XposedHelpers.callMethod(p, "setKey", PREF_KEY_ICON_PATH_SHADE)
             XposedHelpers.callMethod(p, "setTitle", titleShade)
-            XposedHelpers.callMethod(p, "setSummary", currentShadePathHolder[0].ifEmpty { hintPath })
+            XposedHelpers.callMethod(p, "setSummary", summaryOf(currentShadePathHolder[0]))
             XposedHelpers.callMethod(p, "setPersistent", false)
             XposedHelpers.callMethod(p, "setEnabled", isEnabledInit)
             if (currentShadePathHolder[0].isNotEmpty()) trySetIconPreview(p, currentShadePathHolder[0], context)
@@ -794,27 +717,11 @@ object ChannelNotificationIconInjector {
             }
             XposedHelpers.callMethod(p, "setKey", PREF_KEY_ICON_PATH_AOD)
             XposedHelpers.callMethod(p, "setTitle", titleAod)
-            XposedHelpers.callMethod(p, "setSummary", currentAodPathHolder[0].ifEmpty { hintPath })
+            XposedHelpers.callMethod(p, "setSummary", summaryOf(currentAodPathHolder[0]))
             XposedHelpers.callMethod(p, "setPersistent", false)
             XposedHelpers.callMethod(p, "setEnabled", isEnabledInit)
             if (currentAodPathHolder[0].isNotEmpty()) trySetIconPreview(p, currentAodPathHolder[0], context)
             p
-        }
-
-        // ── "Monochrome in shade" switch — coming soon, always on ─────
-        val monoPref: Any? = swClass?.let { cls ->
-            try {
-                val sw = XposedHelpers.newInstance(cls, context)
-                XposedHelpers.callMethod(sw, "setKey", PREF_KEY_ICON_MONO)
-                XposedHelpers.callMethod(sw, "setTitle", titleMono)
-                XposedHelpers.callMethod(sw, "setSummary", comingSoon)
-                XposedHelpers.callMethod(sw, "setPersistent", false)
-                XposedHelpers.callMethod(sw, "setChecked", true)
-                XposedHelpers.callMethod(sw, "setEnabled", false)
-                sw
-            } catch (t: Throwable) {
-                XposedBridge.log("$TAG channelIcon: monoPref error: ${t.message}"); null
-            }
         }
 
         // ── Listeners ─────────────────────────────────────────────────
@@ -858,10 +765,14 @@ object ChannelNotificationIconInjector {
                             XposedHelpers.callMethod(fragment, "getActivity") as? android.app.Activity
                         } catch (_: Throwable) { null }
                         if (activity != null) {
-                            pendingFilePickerCallback = { path ->
+                            pendingFilePickerCallback = cb@{ path ->
+                                if (path == null) {
+                                    Toast.makeText(context, toastFailed, Toast.LENGTH_LONG).show()
+                                    return@cb
+                                }
                                 pathHolder[0] = path
                                 Handler(Looper.getMainLooper()).post {
-                                    try { XposedHelpers.callMethod(displayPref, "setSummary", path.ifEmpty { hintPath }) } catch (_: Throwable) {}
+                                    try { XposedHelpers.callMethod(displayPref, "setSummary", summaryOf(path)) } catch (_: Throwable) {}
                                     trySetIconPreview(displayPref, path, context)
                                     if (path.isNotEmpty()) {
                                         try { XposedHelpers.callMethod(swEnabled, "setChecked", true) } catch (_: Throwable) {}
@@ -908,7 +819,7 @@ object ChannelNotificationIconInjector {
         } else {
             maxPreferenceOrderInGroup(screen) + 1
         }
-        val items = listOfNotNull(swEnabled, pathPref, shadePref, aodPref, monoPref)
+        val items = listOf(swEnabled, pathPref, shadePref, aodPref)
 
         // Use COUIPreferenceCategory as container — COUIPreference items only render
         // setLayoutCategory(1/2/3) correctly when managed by a COUIPreferenceCategory.

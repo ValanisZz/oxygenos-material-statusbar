@@ -7,13 +7,14 @@
     <string name="pref_status_bar">Status Bar</string>
     <string name="pref_status_bar_desc">Apply Material adaptive icons in the status bar</string>
     <string name="pref_shade">Notification Shade</string>
-    <string name="pref_shade_desc">Apply Material adaptive icons in the notification shade</string>
+    <string name="pref_shade_desc">Show colored app icons instead of monochrome notification icons</string>
     <string name="pref_aod">Always on Display</string>
     <string name="pref_aod_desc">Apply Material adaptive icons on AOD screen</string>
     <string name="pref_notification_categories">Custom icons for notification categories</string>
     <string name="pref_notification_categories_desc">Enable this option to add a setting in each app\'s notification preferences that lets you assign a custom icon to individual notification categories (e.g., messages, calls, reminders)</string>
     <string name="pref_custom_icons">Custom icons for system apps</string>
-    <string name="pref_custom_icons_desc">Enable this option to replace the default icons of some system apps with adaptive icons</string>
+    <string name="pref_custom_icons_desc">Replace the default icons of some system apps with Material-style custom icons</string>
+    <string name="pref_custom_icons_master">Use custom icons</string>
     <string name="pref_coming_soon">Will be implemented in the next release</string>
     <string name="btn_restart_systemui">Apply changes and restart SystemUI</string>
     <string name="msg_saved">Applies all pending changes that require a restart of the system interface. SystemUI will be restarted — the screen may briefly go black or the interface may temporarily disappear, then return to normal.</string>
@@ -27,10 +28,8 @@
     <string name="channel_icon_path_placeholder">/storage/emulated/0/Download/my_icon.xml</string>
     <string name="channel_icon_save">Save</string>
     <string name="channel_icon_saved">Saved. Restart SystemUI from Material icons settings to apply.</string>
-    <string name="channel_icon_save_failed">Could not save. Grant root or check storage access.</string>
+    <string name="channel_icon_save_failed">Could not save the icon</string>
     <string name="channel_icon_invalid_path">File not readable</string>
     <string name="channel_icon_reset">Reset</string>
     <string name="channel_icon_reset_done">Icon reset. Restart SystemUI to apply.</string>
-    <string name="pref_shade_group_mono">Monochrome in shade</string>
-    <string name="pref_shade_group_mono_desc">Use monochrome icons for grouped notifications in the notification shade</string>
 </resources>

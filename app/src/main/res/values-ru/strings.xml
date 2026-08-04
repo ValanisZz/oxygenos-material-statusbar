@@ -7,13 +7,14 @@
     <string name="pref_status_bar">Строка состояния</string>
     <string name="pref_status_bar_desc">Использовать Material адаптивные иконки в строке состояния</string>
     <string name="pref_shade">Шторка уведомлений</string>
-    <string name="pref_shade_desc">Использовать Material адаптивные иконки в шторке уведомлений</string>
+    <string name="pref_shade_desc">Показывать цветные значки приложений вместо монохромных значков уведомлений</string>
     <string name="pref_aod">Всегда включенный дисплей (AOD)</string>
     <string name="pref_aod_desc">Использовать Material адаптивные иконки в режиме постоянно включенного дисплея</string>
     <string name="pref_notification_categories">Индивидуальные значки для категорий уведомлений</string>
     <string name="pref_notification_categories_desc">Включите эту опцию, чтобы в настройках уведомлений каждого приложения появилась возможность выбрать собственную иконку для каждой категории уведомлений (например, для сообщений, звонков, напоминаний и т. д.)</string>
     <string name="pref_custom_icons">Авторские иконки для системных приложений</string>
-    <string name="pref_custom_icons_desc">Включите эту опцию, чтобы заменить стандартные значки некоторых системных приложений на адаптивные авторские иконки в стиле Material</string>
+    <string name="pref_custom_icons_desc">Замена стандартных значков некоторых системных приложений на авторские иконки в стиле Material</string>
+    <string name="pref_custom_icons_master">Использовать авторские иконки</string>
     <string name="pref_coming_soon">Будет реализовано в следующей версии</string>
     <string name="btn_restart_systemui">Применить изменения и перезапустить SystemUI</string>
     <string name="msg_saved">Применить все ранее сделанные изменения, требующие перезагрузки оболочки системы. SystemUI будет перезапущен — экран на мгновение погаснет или интерфейс временно пропадёт, затем восстановится в обычном режиме.</string>
@@ -27,10 +28,8 @@
     <string name="channel_icon_path_placeholder">/storage/emulated/0/Download/my_icon.xml</string>
     <string name="channel_icon_save">Сохранить</string>
     <string name="channel_icon_saved">Сохранено. Перезапустите SystemUI в настройках Material icons.</string>
-    <string name="channel_icon_save_failed">Не удалось сохранить. Нужен root или доступ к хранилищу.</string>
+    <string name="channel_icon_save_failed">Не удалось сохранить иконку</string>
     <string name="channel_icon_invalid_path">Файл недоступен для чтения</string>
     <string name="channel_icon_reset">Сброс</string>
     <string name="channel_icon_reset_done">Иконка сброшена. Перезапустите SystemUI для применения.</string>
-    <string name="pref_shade_group_mono">Монохромная в шторке</string>
-    <string name="pref_shade_group_mono_desc">Использовать монохромные иконки для сгруппированных уведомлений в шторке</string>
 </resources>

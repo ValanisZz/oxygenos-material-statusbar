@@ -32,10 +32,24 @@ object PreferenceUtils {
     )
 
     private val lastReloadMs = AtomicLong(0L)
+    private val lastFileAttemptMs = AtomicLong(0L)
+    private val lastFileModMs = AtomicLong(-1L)
+
+    @Volatile
+    private var fileSnapshot: Map<String, Boolean>? = null
 
     @Volatile
     private var cached = ConcurrentHashMap<String, Boolean>()
     private var loggedOnce = false
+
+    // Reloads may read files via `su` (SystemUI can't read /data/system directly) —
+    // never on the calling thread: hooks run on the SystemUI main thread
+    private val reloadPending = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val reloadExecutor by lazy {
+        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "OxygenMaterialPrefs").apply { isDaemon = true; priority = Thread.MIN_PRIORITY }
+        }
+    }
 
     private val xspFallback: XSharedPreferences? by lazy {
         try {
@@ -47,7 +61,7 @@ object PreferenceUtils {
 
     fun globalKey(prefKey: String): String = "$SETTINGS_GLOBAL_PREFIX$prefKey"
 
-    private fun getSystemResolver(): ContentResolver? {
+    fun systemResolver(): ContentResolver? {
         return try {
             val clazz = Class.forName("android.app.ActivityThread")
             val app = clazz.getMethod("currentApplication").invoke(null) as? Context
@@ -59,7 +73,18 @@ object PreferenceUtils {
         val now = System.currentTimeMillis()
         if (now - lastReloadMs.get() < 2000L) return
         lastReloadMs.set(now)
+        if (!reloadPending.compareAndSet(false, true)) return
+        reloadExecutor.execute {
+            try {
+                doReload(now)
+            } catch (_: Throwable) {
+            } finally {
+                reloadPending.set(false)
+            }
+        }
+    }
 
+    private fun doReload(now: Long) {
         /**
          * Раньше при любом непустом Settings.Global делали return и **не читали** XML модуля.
          * В Global часто есть только часть ключей → остальные брали default (у категорийных иконок false)
@@ -67,13 +92,31 @@ object PreferenceUtils {
          * Сейчас: база из файла/XSP, поверх — оверлей Global.
          */
         val merged = ConcurrentHashMap<String, Boolean>()
-        tryLoadFromFileInto(PREFS_PATH, merged)
-        if (merged.isEmpty()) {
-            @Suppress("DEPRECATION")
-            tryLoadFromFileInto(LEGACY_PREFS_PATH, merged)
+        val modMs = try { File(PREFS_PATH).lastModified() } catch (_: Throwable) { 0L }
+        val snapshot = fileSnapshot
+        val unchanged = modMs == lastFileModMs.get()
+        // Re-read the file only when its mtime changed. Missing/unstatable files mean
+        // the read below may spawn `su` — retry those at most every 120 s
+        // (settings toggles propagate via the cheap Settings.Global overlay anyway).
+        val skipFileRead = when {
+            unchanged && snapshot != null && modMs > 0L -> true
+            unchanged && now - lastFileAttemptMs.get() < 120_000L -> true
+            else -> false
         }
-        if (merged.isEmpty()) {
-            tryLoadFromXspInto(merged)
+        if (skipFileRead) {
+            snapshot?.let { merged.putAll(it) }
+        } else {
+            lastFileAttemptMs.set(now)
+            lastFileModMs.set(modMs)
+            tryLoadFromFileInto(PREFS_PATH, merged)
+            if (merged.isEmpty()) {
+                @Suppress("DEPRECATION")
+                tryLoadFromFileInto(LEGACY_PREFS_PATH, merged)
+            }
+            if (merged.isEmpty()) {
+                tryLoadFromXspInto(merged)
+            }
+            if (merged.isNotEmpty()) fileSnapshot = HashMap(merged)
         }
         mergeSettingsGlobalInto(merged)
         if (merged.isNotEmpty()) {
@@ -89,7 +132,7 @@ object PreferenceUtils {
 
     /** Только Global — если файла/XSP нет (редко). */
     private fun tryLoadFromSettingsGlobalOnly(): Boolean {
-        val resolver = getSystemResolver() ?: return false
+        val resolver = systemResolver() ?: return false
         try {
             val map = ConcurrentHashMap<String, Boolean>()
             for (key in KNOWN_KEYS) {
@@ -111,7 +154,7 @@ object PreferenceUtils {
     }
 
     private fun mergeSettingsGlobalInto(map: ConcurrentHashMap<String, Boolean>) {
-        val resolver = getSystemResolver() ?: return
+        val resolver = systemResolver() ?: return
         try {
             for (key in KNOWN_KEYS) {
                 val value = Settings.Global.getInt(resolver, globalKey(key), -1)
@@ -204,6 +247,18 @@ object PreferenceUtils {
         ModulePreferences.KEY_ENABLE_CUSTOM_ICONS,
         ModulePreferences.DEFAULT_ENABLE_CUSTOM_ICONS
     )
+
+    fun isCustomIconEnabled(pkg: String, channelId: String): Boolean =
+        dynamicBoolean(ModulePreferences.customIconAppKey(pkg)) &&
+            dynamicBoolean(ModulePreferences.customIconChannelKey(pkg, channelId))
+
+    // Per-app / per-category keys are dynamic, so the reload overlay (KNOWN_KEYS) doesn't cover
+    // them: read Settings.Global directly (cached client-side by the framework), then the file.
+    private fun dynamicBoolean(key: String): Boolean {
+        val resolver = systemResolver()
+        val v = try { resolver?.let { Settings.Global.getInt(it, globalKey(key), -1) } ?: -1 } catch (_: Throwable) { -1 }
+        return if (v != -1) v == 1 else prefBoolean(key, ModulePreferences.DEFAULT_ENABLE_CUSTOM_ICON)
+    }
 
     fun isNotificationCategoryIconsEnabled(): Boolean = isModuleEnabled() && prefBoolean(
         ModulePreferences.KEY_ENABLE_NOTIFICATION_CATEGORY_ICONS,

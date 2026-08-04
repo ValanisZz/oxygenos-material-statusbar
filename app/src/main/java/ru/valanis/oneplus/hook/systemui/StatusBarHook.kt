@@ -8,6 +8,7 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import ru.valanis.oneplus.hook.core.ChannelIconStore
 import ru.valanis.oneplus.hook.core.IconUtils
 import ru.valanis.oneplus.hook.core.IconUtils.toBitmap
 import ru.valanis.oneplus.hook.core.PreferenceUtils
@@ -40,7 +41,9 @@ object StatusBarHook {
                     val result = param.result ?: return
                     val allowConversationGroup = param.args.getOrNull(1) as? Boolean ?: false
                     if (!allowConversationGroup && !PreferenceUtils.isStatusBarEnabled()) return
-                    if (allowConversationGroup && !PreferenceUtils.isShadeEnabled()) return
+                    if (allowConversationGroup && !PreferenceUtils.isShadeEnabled() &&
+                        !PreferenceUtils.isNotificationCategoryIconsEnabled()
+                    ) return
                     try {
                         val iconBuilder = XposedHelpers.getObjectField(param.thisObject, "iconBuilder") ?: return
                         val context = XposedHelpers.getObjectField(iconBuilder, "context") as? Context ?: return
@@ -173,7 +176,11 @@ object StatusBarHook {
         context: Context
     ) {
         val channelId = try { notification.channelId } catch (_: Throwable) { null } ?: ""
-        val shadeCacheKey = if (channelId.isNotEmpty()) "shade_${pkgName}_$channelId" else "shade_$pkgName"
+        // Shade option off: only per-category icons are applied
+        if (!PreferenceUtils.isShadeEnabled() &&
+            (channelId.isEmpty() || ChannelIconStore.getPath(pkgName, channelId) == null)
+        ) return
+        val shadeCacheKey =if (channelId.isNotEmpty()) "shade_${pkgName}_$channelId" else "shade_$pkgName"
         IconUtils.descriptorCache[shadeCacheKey]?.let { cached ->
             iconField.set(result, cached)
             return
