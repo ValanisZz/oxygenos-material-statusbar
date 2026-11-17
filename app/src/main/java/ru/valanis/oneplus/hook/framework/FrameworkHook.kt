@@ -9,6 +9,7 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import ru.valanis.oneplus.hook.HookStatus
 import ru.valanis.oneplus.hook.core.IconUtils
 import ru.valanis.oneplus.hook.core.PreferenceUtils
 import java.util.concurrent.ConcurrentHashMap
@@ -29,12 +30,12 @@ object FrameworkHook {
     private val droppedTotal = AtomicLong(0)
 
     fun hook(lpparam: XC_LoadPackage.LoadPackageParam) {
-        try {
+        HookStatus.run("OplusNotificationFixHelper.fixSmallIcon") {
             val helperClass = XposedHelpers.findClass(
                 "com.android.server.notification.OplusNotificationFixHelper",
                 lpparam.classLoader
             )
-            XposedBridge.hookAllMethods(
+            val hooked = XposedBridge.hookAllMethods(
                 helperClass,
                 "fixSmallIcon",
                 object : XC_MethodHook() {
@@ -53,15 +54,10 @@ object FrameworkHook {
                     }
                 }
             )
-            XposedBridge.log("$TAG: Framework hook OK")
-        } catch (t: Throwable) {
-            XposedBridge.log("$TAG Framework: ${t.message}")
+            if (hooked.isEmpty()) throw NoSuchMethodError("fixSmallIcon")
         }
-        try {
+        HookStatus.run("NotificationManagerService.enqueueNotificationInternal") {
             hookNotificationDedup(lpparam)
-            XposedBridge.log("$TAG: Framework dedup hook OK")
-        } catch (t: Throwable) {
-            XposedBridge.log("$TAG Framework dedup: ${t.message}")
         }
     }
 

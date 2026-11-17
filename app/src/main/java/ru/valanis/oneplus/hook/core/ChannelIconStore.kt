@@ -27,6 +27,10 @@ object ChannelIconStore {
 
     @Volatile
     private var dirty = true
+    @Volatile
+    private var loaded = false
+    @Volatile
+    private var packages: Set<String> = emptySet()
     private val lastAttemptMs = AtomicLong(0L)
     private val observing = AtomicBoolean(false)
     private val cached = ConcurrentHashMap<String, String>()
@@ -66,9 +70,13 @@ object ChannelIconStore {
                     }
                     return@execute
                 }
+                val changed = !loaded || cached != map
                 cached.keys.retainAll(map.keys)
                 cached.putAll(map)
+                packages = map.keys.mapTo(HashSet()) { it.substringBefore(KEY_SEPARATOR) }
+                loaded = true
                 IconUtils.preloadChannelIcons(map.values)
+                if (changed) IconUtils.onChannelMapChanged()
                 if (!loggedOnce) {
                     loggedOnce = true
                     XposedBridge.log("$TAG ChannelIcons loaded (${map.size} entries)")
@@ -88,6 +96,8 @@ object ChannelIconStore {
                 override fun onChange(selfChange: Boolean) {
                     dirty = true
                     lastAttemptMs.set(0L)
+                    // Pick the change up now, not on the next icon lookup
+                    reload()
                 }
             })
         } catch (t: Throwable) {
@@ -142,9 +152,11 @@ object ChannelIconStore {
     /** True if any icon override (main/shade/aod/mono) is configured for [packageName]. */
     fun hasPackage(packageName: String): Boolean {
         reload()
-        val prefix = "$packageName$KEY_SEPARATOR"
-        return cached.keys.any { it.startsWith(prefix) }
+        return packageName in packages
     }
+
+    /** False until the map has been read once: lookups before that prove nothing. */
+    fun isLoaded(): Boolean = loaded
 
     fun cachedSize(): Int = cached.size
 

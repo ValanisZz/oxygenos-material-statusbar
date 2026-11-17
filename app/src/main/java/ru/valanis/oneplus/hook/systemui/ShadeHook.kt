@@ -9,6 +9,7 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import ru.valanis.oneplus.hook.HookStatus
 import ru.valanis.oneplus.hook.core.ChannelIconStore
 import ru.valanis.oneplus.hook.core.IconUtils
 import ru.valanis.oneplus.hook.core.IconUtils.toBitmap
@@ -45,6 +46,8 @@ object ShadeHook {
         override fun setTintList(tint: android.content.res.ColorStateList?) {}
         override fun setTint(tintColor: Int) {}
     }
+
+    fun noTint(base: Drawable): Drawable = NoTintDrawable(base)
 
     // Cache key suffix: the themed-icon palette differs between light and dark, so the
     // two variants must not share an entry.
@@ -167,6 +170,11 @@ object ShadeHook {
 
     private val appIconAsIconCache = ConcurrentHashMap<String, Icon>()
     private val appIconBitmapCache = ConcurrentHashMap<String, android.graphics.Bitmap>()
+    // Every Icon handed out by getCachedAppIconAsIcon, by identity
+    private val appIconIcons = java.util.Collections.synchronizedMap(java.util.WeakHashMap<Icon, Boolean>())
+
+    private fun appSourceKey(pkg: String, context: android.content.Context): String =
+        "app:$pkg#${themeSuffix(context)}#${iconGeneration.get()}"
 
     // Bumped whenever the app icons themselves change (icon theme switch, app update).
     // Part of the per-view source key so already-bound icon views redraw instead of
@@ -201,13 +209,17 @@ object ShadeHook {
      * (per package) and for theme / wallpaper / configuration changes (everything), so the
      * shade keeps following whatever the launcher is showing.
      */
-    private fun ensureIconThemeReceiver(context: android.content.Context) {
+    fun ensureIconThemeReceiver(context: android.content.Context) {
         if (!iconThemeReceiverRegistered.compareAndSet(false, true)) return
         try {
             val app = context.applicationContext ?: context
             val receiver = object : android.content.BroadcastReceiver() {
                 override fun onReceive(c: android.content.Context?, intent: android.content.Intent?) {
-                    invalidateAppIcons(intent?.data?.schemeSpecificPart)
+                    val pkg = intent?.data?.schemeSpecificPart
+                    invalidateAppIcons(pkg)
+                    // Status bar / AOD icons are cached by resource id, which an app update
+                    // can point at a different drawable
+                    if (pkg != null) IconUtils.invalidatePackage(pkg)
                 }
             }
             val pkgFilter = android.content.IntentFilter().apply {
@@ -260,6 +272,7 @@ object ShadeHook {
             }
             appIconAsIconCache[key] = icon
             appIconBitmapCache[key] = bmp
+            appIconIcons[icon] = true
             icon
         } catch (_: Throwable) {
             null
@@ -288,7 +301,7 @@ object ShadeHook {
                 }
                 val sbn = getSbn.invoke(entry) ?: return
                 val pkg = XposedHelpers.callMethod(sbn, "getPackageName") as? String ?: return
-                val notification = XposedHelpers.callMethod(sbn, "getNotification") as? Notification
+                val notification = (sbn as? android.service.notification.StatusBarNotification)?.let { AodHook.noteNotification(it) }
                 val channelId = try { notification?.channelId } catch (_: Throwable) { null } ?: ""
 
                 val channelPath =
@@ -299,10 +312,8 @@ object ShadeHook {
                 // Shade option off: the category icon follows the stock look - tinted by the
                 // shade like its neighbours when marked monochrome, shown as-is otherwise
                 val tinted = !shadeEnabled && ChannelIconStore.isMonochrome(pkg, channelId)
-                val sourceKey = if (channelPath != null) {
-                    val mtime = try { java.io.File(channelPath).lastModified() } catch (_: Throwable) { 0L }
-                    "$channelPath:$mtime"
-                } else "app:$pkg#${themeSuffix(mIcon.context)}#${iconGeneration.get()}"
+                val sourceKey = if (channelPath != null) IconUtils.pathKey(channelPath)
+                else appSourceKey(pkg, mIcon.context)
 
                 if (tinted) {
                     mIcon.setTag(OUR_ICON_TAG, false)
@@ -351,16 +362,17 @@ object ShadeHook {
             "com.oplus.systemui.notification.row.oplusgroup.OplusNotificationGroupTemplateWrapper" to "onContentUpdated"
         )
         for ((name, methodName) in pairs) {
-            try {
+            HookStatus.run("shade ${name.substringAfterLast('.')}.$methodName") {
                 val wrapperClass = XposedHelpers.findClass(name, lpparam.classLoader)
                 val rowArgIdx = if (methodName == "proxyOnContentUpdated") 0 else -1
-                XposedBridge.hookAllMethods(wrapperClass, methodName, object : XC_MethodHook() {
+                val hooked = XposedBridge.hookAllMethods(wrapperClass, methodName, object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val mRow = if (rowArgIdx >= 0) param.args.getOrNull(rowArgIdx) else null
                         setShadeIcon(param.thisObject, mRow)
                     }
                 })
-            } catch (_: Throwable) {}
+                if (hooked.isEmpty()) throw NoSuchMethodError(methodName)
+            }
         }
 
         // Replace the small icon at RemoteViews bind time, BEFORE the first draw.
@@ -388,22 +400,27 @@ object ShadeHook {
 
         val bindTimeIconHook = object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
-                if (!PreferenceUtils.isShadeEnabled()) return
                 try {
+                    // Hooked on every ImageView of SystemUI: the id test comes first
                     val view = param.thisObject as? ImageView ?: return
                     if (view.id != android.R.id.icon) return
                     val icon = param.args.getOrNull(0) as? Icon ?: return
-                    val pkg: String?
-                    if (icon.type == Icon.TYPE_RESOURCE) {
-                        pkg = try { icon.resPackage } catch (_: Throwable) { null }
-                    } else {
-                        // Bitmap icons may already be ours (bind-time replacement or
-                        // patched mSmallIcon) — leave those in place
-                        if (appIconAsIconCache.containsValue(icon) ||
-                            IconUtils.isChannelOverrideIcon(icon)
-                        ) return
+                    // Our own replacement passing through the super call
+                    if (appIconIcons.containsKey(icon)) return
+                    val shadeEnabled = PreferenceUtils.isShadeEnabled()
+                    val categoryEnabled = PreferenceUtils.isNotificationCategoryIconsEnabled()
+                    if (!shadeEnabled && !categoryEnabled) return
+
+                    // The small icon object identifies its notification (package + category)
+                    // even while the views are inflated off-screen with no row to walk up to
+                    val owner = IconUtils.iconOwner(icon)
+                    val pkg: String? = when {
+                        owner != null -> owner.pkg
+                        // A category icon we already put here, notification unknown
+                        IconUtils.isChannelOverrideIcon(icon) -> return
+                        icon.type == Icon.TYPE_RESOURCE -> try { icon.resPackage } catch (_: Throwable) { null }
                         // App ships a bitmap small icon: no resPackage, resolve via the row
-                        pkg = resolvePkgFromRow(view)
+                        else -> resolvePkgFromRow(view)
                     }
                     if (pkg.isNullOrEmpty()) {
                         if (DEBUG_FLICKER) android.util.Log.e(
@@ -411,15 +428,36 @@ object ShadeHook {
                         )
                         return
                     }
-                    // Channel overrides are applied via patched mSmallIcon / onContentUpdated
-                    if (ChannelIconStore.hasPackage(pkg)) return
-                    val replacement = getCachedAppIconAsIcon(pkg, view.context)
+                    val channelId = owner?.channelId ?: ""
+                    // Category unknown: a package with category icons is finished by
+                    // onContentUpdated, which knows the notification
+                    if (owner == null && categoryEnabled && ChannelIconStore.hasPackage(pkg)) return
+                    val channelPath =
+                        if (channelId.isNotEmpty() && categoryEnabled) ChannelIconStore.getShadePath(pkg, channelId)
+                        else null
+                    // Shade option off: only per-category icons are applied
+                    if (!shadeEnabled && channelPath == null) return
+                    val ctx = view.context
+                    val channelIcon =
+                        if (channelPath != null) IconUtils.channelOverrideIcon(pkg, channelId, ctx, "shade") else null
+                    if (!shadeEnabled && ChannelIconStore.isMonochrome(pkg, channelId)) {
+                        // Stock look: the shade tints the category icon like its neighbours
+                        if (channelIcon != null) param.args[0] = channelIcon
+                        view.setTag(OUR_ICON_TAG, false)
+                        return
+                    }
+                    val replacement = channelIcon ?: getCachedAppIconAsIcon(pkg, ctx)
                     if (DEBUG_FLICKER) android.util.Log.e(
                         TAG,
                         "bind ${param.method.name}: pkg=$pkg iconType=${icon.type} replaced=${replacement != null} thread=${Thread.currentThread().name}"
                     )
                     if (replacement == null) { view.setTag(OUR_ICON_TAG, false); return }
                     param.args[0] = replacement
+                    // Same key setShadeIcon computes: lets it recognise this icon as current
+                    param.setObjectExtra(
+                        "srcKey",
+                        if (channelIcon != null) IconUtils.pathKey(channelPath!!) else appSourceKey(pkg, ctx)
+                    )
                     // Full-color replacement — mark the view so the setOriginalIconColor hook
                     // suppresses the monochrome tint, and clear any view-level tint/dim.
                     view.setTag(OUR_ICON_TAG, true)
@@ -437,10 +475,17 @@ object ShadeHook {
                     val view = param.thisObject as? ImageView ?: return
                     if (view.getTag(OUR_ICON_TAG) != true) return
                     val d = view.drawable ?: return
-                    if (d is NoTintDrawable) return
                     if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
-                        view.setImageDrawable(NoTintDrawable(d))
-                    } else {
+                        // Already wrapped when the subclass override delegated to ImageView
+                        val wrapped = d as? NoTintDrawable
+                            ?: NoTintDrawable(d).also { view.setImageDrawable(it) }
+                        // setImageIcon has set the drawable by now (setImageIconAsync only
+                        // returns a Runnable): onContentUpdated then has nothing to redo
+                        val srcKey = param.getObjectExtra("srcKey") as? String
+                        if (srcKey != null && param.method.name == "setImageIcon") {
+                            view.setTag(ICON_TAG_KEY, srcKey to wrapped)
+                        }
+                    } else if (d !is NoTintDrawable) {
                         view.post {
                             try {
                                 val cur = view.drawable
@@ -454,11 +499,12 @@ object ShadeHook {
             }
         }
         for (name in listOf("com.android.internal.widget.CachingIconView", "android.widget.ImageView")) {
-            try {
+            HookStatus.run("shade ${name.substringAfterLast('.')}.setImageIcon[Async]") {
                 val cls = XposedHelpers.findClass(name, lpparam.classLoader)
-                XposedBridge.hookAllMethods(cls, "setImageIcon", bindTimeIconHook)
-                XposedBridge.hookAllMethods(cls, "setImageIconAsync", bindTimeIconHook)
-            } catch (_: Throwable) {}
+                val hooked = XposedBridge.hookAllMethods(cls, "setImageIcon", bindTimeIconHook) +
+                    XposedBridge.hookAllMethods(cls, "setImageIconAsync", bindTimeIconHook)
+                if (hooked.isEmpty()) throw NoSuchMethodError("setImageIcon")
+            }
         }
 
         // The shade tints the small-icon drawable to a flat monochrome color via
@@ -480,10 +526,12 @@ object ShadeHook {
             "com.oplus.systemui.statusbar.notification.row.NotificationRowIconView",
             "com.android.systemui.statusbar.notification.row.NotificationRowIconView"
         )) {
-            try {
+            HookStatus.run("shade ${name.substringAfterLast('.')}.setOriginalIconColor") {
                 val cls = XposedHelpers.findClass(name, lpparam.classLoader)
-                XposedBridge.hookAllMethods(cls, "setOriginalIconColor", suppressIconColorHook)
-            } catch (_: Throwable) {}
+                if (XposedBridge.hookAllMethods(cls, "setOriginalIconColor", suppressIconColorHook).isEmpty()) {
+                    throw NoSuchMethodError("setOriginalIconColor")
+                }
+            }
         }
 
         // The collapsed-group representative icon is set via setImageDrawable on
@@ -498,14 +546,19 @@ object ShadeHook {
                 lpparam.classLoader
             )
         } catch (_: Throwable) { null }
+        HookStatus.run("shade OplusGroupNotificationRowIconView") {
+            if (groupRowIconClass == null) throw ClassNotFoundException("OplusGroupNotificationRowIconView")
+        }
         if (groupRowIconClass != null) {
             val groupIconHook = object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
+                    // Hooked on every ImageView.setImageDrawable of SystemUI: the class test
+                    // must come before anything else
+                    val view = param.thisObject ?: return
+                    if (!groupRowIconClass.isInstance(view)) return
                     val shadeEnabled = PreferenceUtils.isShadeEnabled()
                     if (!shadeEnabled && !PreferenceUtils.isNotificationCategoryIconsEnabled()) return
                     try {
-                        val view = param.thisObject ?: return
-                        if (!groupRowIconClass.isInstance(view)) return
                         val v = view as? ImageView ?: return
                         val arg = param.args.getOrNull(0) ?: return
 
@@ -534,7 +587,7 @@ object ShadeHook {
                         }
                         val sbn = getSbn.invoke(e) ?: return
                         val pkg = XposedHelpers.callMethod(sbn, "getPackageName") as? String ?: return
-                        val notification = XposedHelpers.callMethod(sbn, "getNotification") as? Notification
+                        val notification = (sbn as? android.service.notification.StatusBarNotification)?.let { AodHook.noteNotification(it) }
                         val channelId = try { notification?.channelId } catch (_: Throwable) { null } ?: ""
                         val ctx = v.context
 

@@ -17,6 +17,10 @@ object PreferenceUtils {
 
     const val SETTINGS_GLOBAL_PREFIX = "oxygen_material_"
 
+    // No UI: `adb shell settings put global oxygen_material_debug_log 1` (0 to stop).
+    // Logs to the LSPosed log which icon each notification got and why.
+    private const val KEY_DEBUG_LOG = "debug_log"
+
     const val PREFS_PATH = "/data/system/${MODULE_PKG}_prefs.xml"
 
     @Deprecated("Old location, kept for migration")
@@ -28,7 +32,8 @@ object PreferenceUtils {
         ModulePreferences.KEY_ENABLE_SHADE,
         ModulePreferences.KEY_ENABLE_AOD,
         ModulePreferences.KEY_ENABLE_NOTIFICATION_CATEGORY_ICONS,
-        ModulePreferences.KEY_ENABLE_CUSTOM_ICONS
+        ModulePreferences.KEY_ENABLE_CUSTOM_ICONS,
+        KEY_DEBUG_LOG
     )
 
     private val lastReloadMs = AtomicLong(0L)
@@ -41,6 +46,12 @@ object PreferenceUtils {
     @Volatile
     private var cached = ConcurrentHashMap<String, Boolean>()
     private var loggedOnce = false
+
+    @Volatile
+    private var dirty = true
+    @Volatile
+    private var loaded = false
+    private val observing = java.util.concurrent.atomic.AtomicBoolean(false)
 
     // Reloads may read files via `su` (SystemUI can't read /data/system directly) —
     // never on the calling thread: hooks run on the SystemUI main thread
@@ -70,13 +81,17 @@ object PreferenceUtils {
     }
 
     private fun reload() {
+        // Watched Settings.Global: changes arrive through the observer, the slow poll is only
+        // a safety net (a read made before the settings provider is up returns nothing).
+        // Not watched yet (no context this early in the process): poll every 2 s
         val now = System.currentTimeMillis()
-        if (now - lastReloadMs.get() < 2000L) return
+        val interval = if (!dirty && observing.get()) 60_000L else 2000L
+        if (now - lastReloadMs.get() < interval) return
         lastReloadMs.set(now)
         if (!reloadPending.compareAndSet(false, true)) return
         reloadExecutor.execute {
             try {
-                doReload(now)
+                doReload()
             } catch (_: Throwable) {
             } finally {
                 reloadPending.set(false)
@@ -84,7 +99,39 @@ object PreferenceUtils {
         }
     }
 
-    private fun doReload(now: Long) {
+    private fun observe(resolver: ContentResolver) {
+        if (!observing.compareAndSet(false, true)) return
+        try {
+            resolver.registerContentObserver(
+                Settings.Global.CONTENT_URI, true,
+                object : android.database.ContentObserver(null) {
+                    override fun onChange(selfChange: Boolean, uri: android.net.Uri?) {
+                        if (uri != null && uri.lastPathSegment?.startsWith(SETTINGS_GLOBAL_PREFIX) != true) return
+                        dirty = true
+                        lastReloadMs.set(0L)
+                        // Per-app / per-category keys are read live: memoized icons are stale now
+                        IconUtils.configGeneration.incrementAndGet()
+                        reload()
+                    }
+                }
+            )
+        } catch (t: Throwable) {
+            observing.set(false)
+            XposedBridge.log("$TAG Prefs observer: ${t.message}")
+        }
+    }
+
+    /** False until the prefs have been read once: until then every switch reports its default. */
+    fun isLoaded(): Boolean = loaded
+
+    /** Starts the first load without waiting for a hook to ask. */
+    fun warmUp() = reload()
+
+    private fun doReload() {
+        val resolver = systemResolver()
+        resolver?.let { observe(it) }
+        // Cleared before the read: a change notified during it marks the prefs dirty again
+        dirty = false
         /**
          * Раньше при любом непустом Settings.Global делали return и **не читали** XML модуля.
          * В Global часто есть только часть ключей → остальные брали default (у категорийных иконок false)
@@ -96,17 +143,17 @@ object PreferenceUtils {
         val snapshot = fileSnapshot
         val unchanged = modMs == lastFileModMs.get()
         // Re-read the file only when its mtime changed. Missing/unstatable files mean
-        // the read below may spawn `su` — retry those at most every 120 s
-        // (settings toggles propagate via the cheap Settings.Global overlay anyway).
+        // the read below may spawn `su` — that is tried once per process, never on a timer
+        // (settings toggles propagate via the Settings.Global overlay anyway).
         val skipFileRead = when {
             unchanged && snapshot != null && modMs > 0L -> true
-            unchanged && now - lastFileAttemptMs.get() < 120_000L -> true
+            unchanged && lastFileAttemptMs.get() != 0L -> true
             else -> false
         }
         if (skipFileRead) {
             snapshot?.let { merged.putAll(it) }
         } else {
-            lastFileAttemptMs.set(now)
+            lastFileAttemptMs.set(System.currentTimeMillis())
             lastFileModMs.set(modMs)
             tryLoadFromFileInto(PREFS_PATH, merged)
             if (merged.isEmpty()) {
@@ -124,10 +171,15 @@ object PreferenceUtils {
                 loggedOnce = true
                 XposedBridge.log("$TAG Prefs merged (file/XSP + Global overlay): $merged")
             }
-            cached = merged
+            if (merged != cached) {
+                cached = merged
+                IconUtils.configGeneration.incrementAndGet()
+            }
         } else {
             tryLoadFromSettingsGlobalOnly()
         }
+        // Without a context Settings.Global was not read: stay dirty and retry
+        if (resolver != null) loaded = true else dirty = true
     }
 
     /** Только Global — если файла/XSP нет (редко). */
@@ -259,6 +311,8 @@ object PreferenceUtils {
         val v = try { resolver?.let { Settings.Global.getInt(it, globalKey(key), -1) } ?: -1 } catch (_: Throwable) { -1 }
         return if (v != -1) v == 1 else prefBoolean(key, ModulePreferences.DEFAULT_ENABLE_CUSTOM_ICON)
     }
+
+    fun isDebugLog(): Boolean = prefBoolean(KEY_DEBUG_LOG, false)
 
     fun isNotificationCategoryIconsEnabled(): Boolean = isModuleEnabled() && prefBoolean(
         ModulePreferences.KEY_ENABLE_NOTIFICATION_CATEGORY_ICONS,

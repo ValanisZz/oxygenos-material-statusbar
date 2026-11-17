@@ -92,9 +92,13 @@ object PreferenceHelper {
         copyAnyProperty(anchor, target, listOf("getLayoutCategory"), listOf("setLayoutCategory"))
         copyAnyProperty(anchor, target, listOf("isNeedChangeDrawType", "getNeedChangeDrawType"), listOf("setNeedChangeDrawType"))
         copyAnyProperty(anchor, target, listOf("isShowSummary", "getShowSummary"), listOf("setShowSummary"))
-        copyAnyProperty(anchor, target, listOf("isShowTwoToneColor", "getShowTwoToneColor"), listOf("setShowTwoToneColor"))
-        copyAnyProperty(anchor, target, listOf("getTintType"), listOf("setTintType"))
-        copyAnyProperty(anchor, target, listOf("getTintIconNew"), listOf("setTintIconNew"))
+        // SettingJumpPreference tints android.R.id.icon on bind from these fields (no getters);
+        // without them the entry icon keeps its own color under COUI / two-tone themes.
+        for (field in listOf("mTintIcon", "mTintType", "mShowTwoToneColor")) {
+            try {
+                XposedHelpers.setObjectField(target, field, XposedHelpers.getObjectField(anchor, field))
+            } catch (_: Throwable) {}
+        }
     }
 
     private fun copyProperty(source: Any, target: Any, getter: String, setter: String) {
