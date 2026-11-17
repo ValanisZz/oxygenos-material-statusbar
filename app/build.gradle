@@ -13,8 +13,8 @@ android {
         minSdk 26
         //noinspection OldTargetApi
         targetSdk 34
-        versionCode 160004
-        versionName "16.4"
+        versionCode 170000
+        versionName "17.0"
     }
 
     kotlin {

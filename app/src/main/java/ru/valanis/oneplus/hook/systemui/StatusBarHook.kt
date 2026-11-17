@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.Notification
 import android.content.Context
 import android.graphics.drawable.Icon
+import android.service.notification.StatusBarNotification
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
@@ -18,6 +19,9 @@ object StatusBarHook {
 
     private const val TAG = "OxygenOSMaterialIcons"
 
+    @Volatile
+    private var appContext: Context? = null
+
     fun hook(lpparam: XC_LoadPackage.LoadPackageParam) {
         val iconManagerClass = XposedHelpers.findClass(
             "com.android.systemui.statusbar.notification.icon.IconManager",
@@ -31,6 +35,9 @@ object StatusBarHook {
             "com.android.internal.statusbar.StatusBarIcon",
             lpparam.classLoader
         )
+        // Resolved once: this hook runs for every icon update of every notification
+        val getSbn = notificationEntryClass.getDeclaredMethod("getSbn").apply { isAccessible = true }
+        val iconField = XposedHelpers.findField(statusBarIconClass, "icon")
         XposedHelpers.findAndHookMethod(
             iconManagerClass,
             "getIconDescriptor",
@@ -45,19 +52,30 @@ object StatusBarHook {
                         !PreferenceUtils.isNotificationCategoryIconsEnabled()
                     ) return
                     try {
-                        val iconBuilder = XposedHelpers.getObjectField(param.thisObject, "iconBuilder") ?: return
-                        val context = XposedHelpers.getObjectField(iconBuilder, "context") as? Context ?: return
-                        val entry = param.args[0]
-                        val sbn = notificationEntryClass.getDeclaredMethod("getSbn").invoke(entry) ?: return
-                        val pkgName = XposedHelpers.callMethod(sbn, "getPackageName") as? String ?: return
-                        val notification = XposedHelpers.callMethod(sbn, "getNotification") as Notification
-                        val iconField = XposedHelpers.findField(statusBarIconClass, "icon")
-
-                        // Replace notification.smallIcon once so all system renderers use our icon
-                        patchNotificationSmallIcon(pkgName, notification, context)
+                        val context = appContext ?: run {
+                            val iconBuilder = XposedHelpers.getObjectField(param.thisObject, "iconBuilder") ?: return
+                            (XposedHelpers.getObjectField(iconBuilder, "context") as? Context ?: return)
+                                .also { appContext = it }
+                        }
+                        // App updates change what a resource id points at: watch for them
+                        ShadeHook.ensureIconThemeReceiver(context)
+                        val sbn = getSbn.invoke(param.args[0]) as? StatusBarNotification ?: return
+                        val pkgName = sbn.packageName ?: return
+                        val notification = AodHook.noteNotification(sbn) ?: return
 
                         if (!allowConversationGroup) {
                             handleStatusBarIcon(result, iconField, pkgName, notification, context)
+                            if (PreferenceUtils.isDebugLog()) {
+                                @Suppress("DEPRECATION")
+                                val saved = notification.extras?.getParcelable(IconUtils.EXTRAS_ORIGINAL_ICON) as? Icon
+                                XposedBridge.log(
+                                    "$TAG statusbar key=${sbn.key} group=${sbn.groupKey} " +
+                                        "summary=${(notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0} " +
+                                        "post=${sbn.postTime} channel=${notification.channelId} " +
+                                        "small=${notification.smallIcon} saved=$saved legacyRes=${notification.icon} " +
+                                        "shown=${iconField.get(result)}"
+                                )
+                            }
                         } else {
                             handleShadeIcon(result, iconField, pkgName, notification, context)
                         }
@@ -67,33 +85,6 @@ object StatusBarHook {
                 }
             }
         )
-    }
-
-    /**
-     * Patches [Notification.mSmallIcon] with the channel override so that every system
-     * renderer (shade, heads-up, AOD, lock-screen) automatically picks it up.
-     * The original icon is saved to extras once so it can be restored later.
-     */
-    private fun patchNotificationSmallIcon(pkgName: String, notification: Notification, context: Context) {
-        val channelId = try { notification.channelId } catch (_: Throwable) { null } ?: ""
-        if (channelId.isEmpty()) return
-        // Already patched?
-        val extras = notification.extras ?: return
-        if (extras.containsKey(IconUtils.EXTRAS_ORIGINAL_ICON)) return
-        val override = IconUtils.channelOverrideIcon(pkgName, channelId, context) ?: return
-        // Save original before replacing
-        try { extras.putParcelable(IconUtils.EXTRAS_ORIGINAL_ICON, notification.smallIcon) } catch (_: Throwable) {}
-        try {
-            XposedHelpers.setObjectField(notification, "mSmallIcon", override)
-        } catch (_: Throwable) {}
-    }
-
-    @Suppress("DEPRECATION")
-    private fun originalSmallIcon(notification: Notification): Icon? {
-        val saved = try {
-            notification.extras?.getParcelable(IconUtils.EXTRAS_ORIGINAL_ICON) as? Icon
-        } catch (_: Throwable) { null }
-        return saved ?: notification.smallIcon
     }
 
     private fun handleStatusBarIcon(
@@ -106,9 +97,14 @@ object StatusBarHook {
         val channelId = try { notification.channelId } catch (_: Throwable) { null } ?: ""
         val channelOverride = if (channelId.isNotEmpty())
             IconUtils.channelOverrideIcon(pkgName, channelId, context) else null
+        // The app's own icon as the framework hook saved it at post time
+        @Suppress("DEPRECATION")
+        val saved = try {
+            notification.extras?.getParcelable(IconUtils.EXTRAS_ORIGINAL_ICON) as? Icon
+        } catch (_: Throwable) { null }
         val smallIcon = channelOverride
             ?: IconUtils.customSmallIcon(pkgName, notification, context)
-            ?: originalSmallIcon(notification) ?: return
+            ?: saved ?: notification.smallIcon ?: return
         val iconKey = IconUtils.getIconCacheKey(smallIcon, pkgName) ?: "bmp_${pkgName}_$channelId"
         val cacheKey = "sb_$iconKey"
 
@@ -126,9 +122,9 @@ object StatusBarHook {
         }
 
         var finalIcon: Icon = smallIcon
-        val iconType = try { XposedHelpers.getIntField(smallIcon, "mType") } catch (_: Throwable) { -1 }
+        val iconType = try { smallIcon.type } catch (_: Throwable) { -1 }
 
-        if (iconType == 2) {
+        if (iconType == Icon.TYPE_RESOURCE) {
             val pkgContext = try { context.createPackageContext(pkgName, 0) } catch (_: Throwable) { context }
             val themedD = try { smallIcon.loadDrawable(pkgContext) } catch (_: Throwable) { null }
 
@@ -141,8 +137,12 @@ object StatusBarHook {
                 }
             }
         } else {
+            // The legacy resource id is only a way to recover the app's icon when the OS has
+            // replaced the small icon and nothing was saved. With a saved icon it must not be
+            // used: Notification.Builder never clears it, so it can name a previous icon
+            // (missed call) while the current one (chat) is a bitmap.
             @Suppress("DEPRECATION")
-            val resId = notification.icon
+            val resId = if (saved == null) notification.icon else 0
             if (resId != 0) {
                 try {
                     finalIcon = Icon.createWithResource(pkgName, resId)

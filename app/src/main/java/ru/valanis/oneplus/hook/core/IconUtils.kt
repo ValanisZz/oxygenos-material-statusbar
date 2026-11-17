@@ -70,6 +70,54 @@ object IconUtils {
     private val channelDrawableByPath = ConcurrentHashMap<String, Drawable>()
     private val channelIconByKey = ConcurrentHashMap<String, Icon>()
 
+    // Bumped when the prefs or the channel map change: work memoized per notification
+    // (small-icon patch, AOD icon) is redone on the next touch
+    val configGeneration = java.util.concurrent.atomic.AtomicInteger(0)
+
+    class IconOwner(val pkg: String, val channelId: String)
+
+    // Identity-keyed (Icon / Bitmap don't override equals), weak: entries die with the icon
+    private val iconOwners = java.util.Collections.synchronizedMap(java.util.WeakHashMap<Icon, IconOwner>())
+    private val channelOverrideIcons = java.util.Collections.synchronizedMap(java.util.WeakHashMap<Icon, Boolean>())
+    private val bitmapHashes = java.util.Collections.synchronizedMap(java.util.WeakHashMap<Bitmap, Int>())
+
+    /** Remembers which notification a small icon belongs to, for the bind-time shade hook. */
+    fun setIconOwner(icon: Icon, pkg: String, channelId: String) {
+        iconOwners[icon] = IconOwner(pkg, channelId)
+    }
+
+    fun iconOwner(icon: Icon): IconOwner? = iconOwners[icon]
+
+    /** A private copy of a channel-override icon (same bitmap), so it can have its own owner. */
+    fun copyChannelOverrideIcon(icon: Icon): Icon {
+        val bmp = try { XposedHelpers.callMethod(icon, "getBitmap") as? Bitmap } catch (_: Throwable) { null }
+            ?: return icon
+        return Icon.createWithBitmap(bmp).also { channelOverrideIcons[it] = true }
+    }
+
+    fun pathKey(path: String): String =
+        // Provider files are named by content: a changed icon is a new URI, nothing to stat
+        if (path.startsWith("content://")) path
+        else "$path:${try { File(path).lastModified() } catch (_: Throwable) { 0L }}"
+
+    /** The channel map changed: drop everything derived from it. */
+    fun onChannelMapChanged() {
+        channelIconByKey.clear()
+        loadFailureAtMs.clear()
+        descriptorCache.keys.removeIf { it.startsWith("shade_") }
+        configGeneration.incrementAndGet()
+    }
+
+    /** [pkg] was updated/changed: its resource ids may now point at other drawables. */
+    fun invalidatePackage(pkg: String) {
+        val marker = "_${pkg}_"
+        monochromeCache.keys.removeIf { it.contains(marker) }
+        fitCache.keys.removeIf { it.contains(marker) }
+        rawIconCache.keys.removeIf { it.contains(marker) }
+        descriptorCache.keys.removeIf { it.contains(marker) }
+        configGeneration.incrementAndGet()
+    }
+
     // Paths that recently failed to load — don't retry for 30 s
     private val loadFailureAtMs = ConcurrentHashMap<String, Long>()
     private val preloading = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -95,17 +143,6 @@ object IconUtils {
         ChannelIconStore.invalidateCache()
     }
 
-    /**
-     * Clears all bitmap-keyed cache entries for [pkg] so a freshly patched channel-override
-     * icon is rendered correctly instead of stale monochrome / fitted variants.
-     * Called from [ru.valanis.oneplus.hook.systemui.AodHook.tryEarlyPatch] after patching.
-     */
-    fun clearPackageBitmapCaches(pkg: String) {
-        val prefix = "fallback_$pkg"
-        monochromeCache.keys.removeIf { it.startsWith(prefix) }
-        fitCache.keys.removeIf { it.contains(prefix) }
-    }
-
     private const val ANDROID_NS = "http://schemas.android.com/apk/res/android"
 
     /** Reads an icon: a module provider URI ([ChannelIconStore]) or a plain readable file. */
@@ -128,8 +165,7 @@ object IconUtils {
      */
     fun loadDrawableFromXmlPath(path: String, context: Context): Drawable? {
         return try {
-            val file = File(path)
-            val cacheKey = "${path}:${file.lastModified()}"
+            val cacheKey = pathKey(path)
             channelDrawableByPath[cacheKey]?.let { d ->
                 return d.constantState?.newDrawable()?.mutate() ?: d
             }
@@ -176,7 +212,7 @@ object IconUtils {
      * notification is a cache hit instead of a synchronous file read + parse.
      */
     fun preloadChannelIcons(values: Collection<String>) {
-        val paths = values.filter { it.startsWith("/") }.distinct()
+        val paths = values.filter { it.startsWith("/") || it.startsWith("content://") }.distinct()
         if (paths.isEmpty()) return
         if (!preloading.compareAndSet(false, true)) return
         Thread {
@@ -500,8 +536,7 @@ object IconUtils {
             "aod"   -> ChannelIconStore.getAodPath(pkg, channelId)
             else    -> ChannelIconStore.getPath(pkg, channelId)
         } ?: return null
-        val mtime = try { File(path).lastModified() } catch (_: Throwable) { 0L }
-        val iconKey = "$path:$mtime"
+        val iconKey = pathKey(path)
         channelIconByKey[iconKey]?.let { return it }
         val d = loadDrawableFromXmlPath(path, context)
         if (d == null) {
@@ -511,11 +546,12 @@ object IconUtils {
         val icon = Icon.createWithBitmap(d.toBitmap())
         evictIfNeeded(channelIconByKey, 40)
         channelIconByKey[iconKey] = icon
+        channelOverrideIcons[icon] = true
         return icon
     }
 
     /** True if [icon] is one of the channel-override bitmaps produced by this module. */
-    fun isChannelOverrideIcon(icon: Icon): Boolean = channelIconByKey.containsValue(icon)
+    fun isChannelOverrideIcon(icon: Icon): Boolean = channelOverrideIcons.containsKey(icon)
 
     fun customSmallIcon(pkg: String, notification: Notification? = null, context: Context? = null): Icon? {
         if (!PreferenceUtils.isCustomIconsEnabled()) return null
@@ -553,24 +589,23 @@ object IconUtils {
     }
 
     fun getIconCacheKey(icon: Icon, pkg: String): String? {
-        try {
-            val type = XposedHelpers.getIntField(icon, "mType")
-            // Bitmap / adaptive-bitmap icons have no resource id - key them by pixel content,
-            // otherwise all bitmap icons of a package (e.g. Teams missed call vs chat) share one entry
-            if (type == 1 || type == 5) {
-                val bmp = XposedHelpers.callMethod(icon, "getBitmap") as? Bitmap ?: return null
-                return "fallback_${pkg}_${bitmapHash(bmp)}"
+        return try {
+            when (icon.type) {
+                // Bitmap / adaptive-bitmap icons have no resource id - key them by pixel content,
+                // otherwise all bitmap icons of a package (e.g. Teams missed call vs chat) share one entry
+                Icon.TYPE_BITMAP, Icon.TYPE_ADAPTIVE_BITMAP -> {
+                    val bmp = XposedHelpers.callMethod(icon, "getBitmap") as? Bitmap ?: return null
+                    "fallback_${pkg}_${bitmapHash(bmp)}"
+                }
+                Icon.TYPE_RESOURCE -> {
+                    val resId = icon.resId
+                    if (resId == 0) null else "r_${icon.resPackage.ifEmpty { pkg }}_$resId"
+                }
+                // URI icons: keyed by the URI, not by package/channel (6 = TYPE_URI_ADAPTIVE_BITMAP)
+                Icon.TYPE_URI, 6 -> "u_${pkg}_${icon.uri}"
+                else -> null
             }
-            if (type != 2) return null
-            val resId = try {
-                icon.javaClass.getDeclaredMethod("getResId").apply { isAccessible = true }.invoke(icon) as Int
-            } catch (_: Throwable) { XposedHelpers.getIntField(icon, "mInt1") }
-            if (resId == 0) return null
-            val resPkg = try {
-                icon.javaClass.getDeclaredMethod("getResPackage").apply { isAccessible = true }.invoke(icon) as? String
-            } catch (_: Throwable) { try { XposedHelpers.getObjectField(icon, "mString1") as? String } catch (_: Throwable) { null } } ?: pkg
-            return "r_${resPkg}_$resId"
-        } catch (_: Throwable) { return null }
+        } catch (_: Throwable) { null }
     }
 
     fun getCachedMonochrome(icon: Icon?, pkg: String, drawable: Drawable, rawPath: Boolean = false): Drawable {
@@ -583,9 +618,12 @@ object IconUtils {
     }
 
     private fun bitmapHash(bmp: Bitmap): Int {
+        bitmapHashes[bmp]?.let { return it }
         val pixels = IntArray(bmp.width * bmp.height)
         bmp.getPixels(pixels, 0, bmp.width, 0, 0, bmp.width, bmp.height)
-        return 31 * (31 * bmp.width + bmp.height) + pixels.contentHashCode()
+        val hash = 31 * (31 * bmp.width + bmp.height) + pixels.contentHashCode()
+        bitmapHashes[bmp] = hash
+        return hash
     }
 
     fun getCachedMonochromeFallback(pkg: String, drawable: Drawable): Drawable {
@@ -594,25 +632,10 @@ object IconUtils {
 
     fun loadIconWithoutTheme(icon: Icon, pkg: String, context: Context): Drawable? {
         try {
-            val iconType = XposedHelpers.getIntField(icon, "mType")
-            if (iconType != 2) return null
-
-            val resId = try {
-                val m = icon.javaClass.getDeclaredMethod("getResId")
-                m.isAccessible = true
-                m.invoke(icon) as Int
-            } catch (_: Throwable) {
-                XposedHelpers.getIntField(icon, "mInt1")
-            }
+            if (icon.type != Icon.TYPE_RESOURCE) return null
+            val resId = icon.resId
             if (resId == 0) return null
-
-            val resPkg = try {
-                val m = icon.javaClass.getDeclaredMethod("getResPackage")
-                m.isAccessible = true
-                m.invoke(icon) as? String
-            } catch (_: Throwable) {
-                try { XposedHelpers.getObjectField(icon, "mString1") as? String } catch (_: Throwable) { null }
-            } ?: pkg
+            val resPkg = icon.resPackage.ifEmpty { pkg }
 
             val key = "raw_${resPkg}_$resId"
             evictIfNeeded(rawIconCache, MAX_RAW_ICON_CACHE)
